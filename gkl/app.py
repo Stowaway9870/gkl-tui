@@ -31,11 +31,7 @@ from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
 )
-from gkl.player_explorer import (
-    build_ownership_timeline, map_weeks_to_stints, load_stint_roster_data,
-    compute_stint_stats, compute_usage_summary, classify_position,
-    OwnershipStint, UsageSummary, StintStats,
-)
+from gkl.datastore import RosterDataStore
 from gkl.mlb_api import MLBGame, get_mlb_scoreboard
 from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
@@ -2301,9 +2297,7 @@ class PlayerExplorerScreen(Screen):
         self.league = league
         self.categories = categories
         self._player = player
-        self._transactions: list[Transaction] = []
-        self._stints: list[OwnershipStint] = []
-        self._week_dates: dict[int, tuple[str, str]] = {}
+        self._store = RosterDataStore()
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -2366,48 +2360,38 @@ class PlayerExplorerScreen(Screen):
         p = self._player
         assert p is not None
 
-        # 1. Get transactions
-        await self._show_loading("Fetching transaction history...")
-        self._transactions = self.api.get_transactions(
-            self.league.league_key, count=200,
+        # 1. Sync roster data (fetches from Yahoo and caches in SQLite)
+        def _progress(msg: str) -> None:
+            # Can't await from sync callback, so just update directly
+            try:
+                self.call_from_thread(self._show_loading, msg)
+            except Exception:
+                pass
+
+        await self._show_loading("Syncing roster data from Yahoo...")
+        synced = self._store.sync_all_weeks(
+            self.api, self.league,
+            progress_callback=_progress,
+        )
+        if synced > 0:
+            await self._show_loading(f"Synced {synced} week(s) of roster data.")
+
+        # 2. Query the cache for this player
+        await self._show_loading("Analyzing player data...")
+
+        total_weeks = self.league.current_week
+
+        stints = self._store.get_player_stints(
+            self.league.league_key, p.player_key,
+        )
+        usage = self._store.get_player_usage_summary(
+            self.league.league_key, p.player_key, total_weeks,
+        )
+        timeline = self._store.get_player_timeline(
+            self.league.league_key, p.player_key, total_weeks,
         )
 
-        # 2. Build ownership timeline
-        await self._show_loading("Building ownership timeline...")
-        self._stints = build_ownership_timeline(
-            p.player_key, self._transactions,
-        )
-
-        # 3. Get week date ranges
-        await self._show_loading("Loading week schedule...")
-        self._week_dates = self.api.get_week_dates(self.league.league_key)
-
-        # 4. Map weeks to stints
-        if self._week_dates:
-            map_weeks_to_stints(self._stints, self._week_dates)
-
-        # 5. Load roster data for each stint's weeks
-        total_weeks = sum(len(s.weeks) for s in self._stints)
-        loaded = 0
-        for stint in self._stints:
-            for week in stint.weeks:
-                loaded += 1
-                await self._show_loading(
-                    f"Loading roster data... ({loaded}/{total_weeks})"
-                )
-                try:
-                    players = self.api.get_roster_stats(stint.team_key, week)
-                    for rp in players:
-                        if rp.player_key == p.player_key:
-                            stint.week_data[week] = (
-                                rp.selected_position, rp.stats,
-                            )
-                            break
-                except Exception:
-                    continue
-
-        # 6. Render all sections
-        await self._show_loading("Rendering player analysis...")
+        # 3. Render all sections
         scroll = self.query_one("#pe-scroll", VerticalScroll)
         await scroll.remove_children()
 
@@ -2418,7 +2402,7 @@ class PlayerExplorerScreen(Screen):
         )
         usage_widget = Static("", classes="pe-usage-bar")
         await scroll.mount(label1, usage_widget)
-        self._render_usage_summary(usage_widget)
+        self._render_usage_summary(usage_widget, usage, total_weeks)
 
         # --- Roster Breakdown by Team ---
         label2 = Static(
@@ -2427,7 +2411,7 @@ class PlayerExplorerScreen(Screen):
         )
         table2 = DataTable(classes="pe-table")
         await scroll.mount(label2, table2)
-        self._render_roster_breakdown(table2)
+        self._render_roster_breakdown(table2, stints)
 
         # --- Season Timeline ---
         label3 = Static(
@@ -2436,45 +2420,43 @@ class PlayerExplorerScreen(Screen):
         )
         timeline_widget = Static("", classes="pe-usage-bar")
         await scroll.mount(label3, timeline_widget)
-        self._render_timeline(timeline_widget)
+        self._render_timeline(timeline_widget, timeline)
 
         self._hide_loading()
 
-    def _render_usage_summary(self, widget: Static) -> None:
+    def _render_usage_summary(
+        self, widget: Static, usage: dict, total_weeks: int,
+    ) -> None:
         """Render the usage summary (started %, benched %, IL %, not owned %)."""
         scored = [c for c in self.categories if not c.is_only_display]
-        bat_ids = [c.stat_id for c in scored if c.position_type == "B"]
-
-        season_days = 195  # approximate MLB season length
-        summary = compute_usage_summary(
-            self._stints, season_days, bat_ids,
-        )
+        bat_cats = [c for c in scored if c.position_type == "B"]
 
         text = Text()
         text.append("\n")
 
         sections = [
-            ("STARTED", summary.started_days, summary.started_stats, "bold green"),
-            ("BENCHED", summary.benched_days, summary.benched_stats, "bold yellow"),
-            ("IL / NA", summary.il_days, summary.il_stats, "bold magenta"),
-            ("NOT OWNED", summary.not_owned_days, summary.not_owned_stats, "dim"),
+            ("STARTED", usage["started"], "bold green"),
+            ("BENCHED", usage["benched"], "bold yellow"),
+            ("IL / NA", usage["il"], "bold magenta"),
+            ("NOT OWNED", usage["not_owned"], "dim"),
         ]
 
-        for label, days, stats, style in sections:
-            pct = round(days / max(1, summary.total_days) * 100)
+        for label, data, style in sections:
+            weeks = data["weeks"]
+            pct = round(weeks / max(1, total_weeks) * 100)
             text.append(f"  {pct}%", style=style)
             text.append(f" {label}", style="bold")
-            text.append(f"  ({days} of {summary.total_days} days)  ", style="dim")
+            text.append(f"  ({weeks} of {total_weeks} weeks)  ", style="dim")
 
         text.append("\n\n")
 
-        # Show stats for each usage type
-        scored_bat = [c for c in scored if c.position_type == "B"]
-        for label, days, stats, style in sections:
+        # Show stats per usage type
+        for label, data, style in sections:
+            stats = data.get("stats", {})
             if not stats:
                 continue
             text.append(f"  {label}: ", style="bold")
-            for cat in scored_bat:
+            for cat in bat_cats:
                 val = stats.get(cat.stat_id, "-")
                 text.append(f"{cat.display_name}:{val} ", style="dim")
             text.append("\n")
@@ -2482,158 +2464,181 @@ class PlayerExplorerScreen(Screen):
         text.append("\n")
         widget.update(text)
 
-    def _render_roster_breakdown(self, table: DataTable) -> None:
-        """Render the per-team stats breakdown table (Image 9 reference)."""
+    def _render_roster_breakdown(
+        self, table: DataTable, stints: list[dict],
+    ) -> None:
+        """Render per-team stats breakdown table."""
         scored = [c for c in self.categories if not c.is_only_display]
         bat_cats = [c for c in scored if c.position_type == "B"]
-        bat_ids = [c.stat_id for c in bat_cats]
 
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
 
-        cols = ["Team".ljust(24), "Status", "Dates", "Days"]
+        cols = ["Team".ljust(24), "Status", "Dates", "Weeks"]
         for cat in bat_cats:
             cols.append(cat.display_name)
         table.add_columns(*cols)
 
-        grand_total = StintStats()
+        active_positions = {
+            "C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF",
+            "Util", "DH", "SP", "RP", "P",
+        }
+        il_positions = {"IL", "IL+", "DL", "NA"}
 
-        for stint in self._stints:
-            stint_stats = compute_stint_stats(stint, bat_ids)
+        grand_total_stats: dict[str, str] = {}
+        grand_total_weeks = 0
 
-            # Total row for this team
+        for stint in stints:
+            weeks = stint["weeks"]
+            team_name = stint["team_name"]
+            if not weeks:
+                continue
+
+            # Compute date range
+            first_start = weeks[0].get("week_start", "")
+            last_end = weeks[-1].get("week_end", "")
+            from datetime import datetime
+            try:
+                ds = datetime.strptime(first_start, "%Y-%m-%d").strftime("%b %d")
+                de = datetime.strptime(last_end, "%Y-%m-%d").strftime("%b %d")
+                date_range = f"{ds} - {de}"
+            except (ValueError, TypeError):
+                date_range = ""
+
+            # Aggregate stats: total, started, benched
+            total_stats: dict[str, str] = {}
+            started_stats: dict[str, str] = {}
+            benched_stats: dict[str, str] = {}
+            started_weeks = 0
+            benched_weeks = 0
+
+            for wd in weeks:
+                sel_pos = wd.get("selected_position", "BN")
+                stats = wd.get("stats", {})
+
+                if sel_pos in active_positions:
+                    started_weeks += 1
+                    _acc(started_stats, stats)
+                elif sel_pos == "BN":
+                    benched_weeks += 1
+                    _acc(benched_stats, stats)
+                _acc(total_stats, stats)
+
+            num_weeks = len(weeks)
+            grand_total_weeks += num_weeks
+            _acc(grand_total_stats, total_stats)
+
+            # Team total row
             row: list[Text] = [
-                Text(stint.team_name[:24].ljust(24), style="bold"),
+                Text(team_name[:24].ljust(24), style="bold"),
                 Text("Total", style="bold"),
-                Text(stint.date_range_str, style="dim"),
-                Text(str(stint.days), justify="right"),
+                Text(date_range, style="dim"),
+                Text(str(num_weeks), justify="right"),
             ]
             for cat in bat_cats:
-                row.append(Text(stint_stats.total_stats.get(cat.stat_id, "-"),
+                row.append(Text(total_stats.get(cat.stat_id, "-"),
                                 justify="right"))
             table.add_row(*row)
 
             # Started sub-row
-            if stint_stats.started_days > 0:
+            if started_weeks > 0:
                 row_s: list[Text] = [
-                    Text("", style="dim"),
+                    Text(""),
                     Text("  Started", style="dim"),
                     Text(""),
-                    Text(str(stint_stats.started_days), justify="right", style="dim"),
+                    Text(str(started_weeks), justify="right", style="dim"),
                 ]
                 for cat in bat_cats:
                     row_s.append(Text(
-                        stint_stats.started_stats.get(cat.stat_id, "-"),
+                        started_stats.get(cat.stat_id, "-"),
                         justify="right", style="dim",
                     ))
                 table.add_row(*row_s)
 
             # Benched sub-row
-            if stint_stats.benched_days > 0:
+            if benched_weeks > 0:
                 row_b: list[Text] = [
-                    Text("", style="dim"),
+                    Text(""),
                     Text("  Benched", style="dim"),
                     Text(""),
-                    Text(str(stint_stats.benched_days), justify="right", style="dim"),
+                    Text(str(benched_weeks), justify="right", style="dim"),
                 ]
                 for cat in bat_cats:
                     row_b.append(Text(
-                        stint_stats.benched_stats.get(cat.stat_id, "-"),
+                        benched_stats.get(cat.stat_id, "-"),
                         justify="right", style="dim",
                     ))
                 table.add_row(*row_b)
 
-            # Accumulate grand total
-            for sid in bat_ids:
-                val = stint_stats.total_stats.get(sid, "0")
-                if "/" in val:
-                    e = grand_total.total_stats.get(sid, "0/0").split("/")
-                    v = val.split("/")
-                    try:
-                        grand_total.total_stats[sid] = (
-                            f"{int(e[0])+int(v[0])}/{int(e[1])+int(v[1])}"
-                        )
-                    except (ValueError, IndexError):
-                        pass
-                else:
-                    try:
-                        cur = int(grand_total.total_stats.get(sid, "0"))
-                        grand_total.total_stats[sid] = str(cur + int(val))
-                    except ValueError:
-                        pass
-            grand_total.total_days += stint.days
-
         # Grand total row
-        if self._stints:
-            total_days = grand_total.total_days
-            first_date = self._stints[0].start_date if self._stints else ""
-            last_date = self._stints[-1].end_date or "present"
-            from datetime import datetime
-            if first_date:
-                fd = datetime.strptime(first_date, "%Y-%m-%d").strftime("%b %d")
-            else:
-                fd = ""
-            if last_date != "present":
-                ld = datetime.strptime(last_date, "%Y-%m-%d").strftime("%b %d")
-            else:
-                ld = "present"
-
+        if stints:
             row_t: list[Text] = [
                 Text("TOT".ljust(24), style="bold"),
                 Text("Total", style="bold"),
-                Text(f"{fd} - {ld}", style="dim"),
-                Text(str(total_days), justify="right", style="bold"),
+                Text(""),
+                Text(str(grand_total_weeks), justify="right", style="bold"),
             ]
             for cat in bat_cats:
                 row_t.append(Text(
-                    grand_total.total_stats.get(cat.stat_id, "-"),
+                    grand_total_stats.get(cat.stat_id, "-"),
                     justify="right", style="bold",
                 ))
             table.add_row(*row_t)
 
-    def _render_timeline(self, widget: Static) -> None:
-        """Render a text-based season timeline showing ownership by month."""
-        if not self._stints or not self._week_dates:
+    def _render_timeline(
+        self, widget: Static, timeline: list[dict],
+    ) -> None:
+        """Render week-by-week season timeline with colored blocks."""
+        if not timeline:
             widget.update(Text("  No timeline data available.\n", style="dim"))
             return
 
-        from datetime import datetime, timedelta
+        from datetime import datetime
 
         text = Text()
         text.append("\n")
 
-        # Build week-by-week status
-        week_status: dict[int, tuple[str, str]] = {}  # week -> (status, team_name)
-        for stint in self._stints:
-            for week, (sel_pos, _stats) in stint.week_data.items():
-                usage = classify_position(sel_pos)
-                week_status[week] = (usage, stint.team_name)
-
-        # Group weeks by month
-        months: dict[str, list[int]] = {}
-        for week in sorted(self._week_dates.keys()):
-            start_str = self._week_dates[week][0]
-            month = datetime.strptime(start_str, "%Y-%m-%d").strftime("%B")
+        # Group by month
+        months: dict[str, list[dict]] = {}
+        for entry in timeline:
+            ws = entry.get("week_start", "")
+            if ws:
+                try:
+                    month = datetime.strptime(ws, "%Y-%m-%d").strftime("%B")
+                except ValueError:
+                    month = f"Week {entry['week']}"
+            else:
+                month = f"Week {entry['week']}"
             if month not in months:
                 months[month] = []
-            months[month].append(week)
+            months[month].append(entry)
 
         status_colors = {
             "started": "green",
             "benched": "yellow",
             "il": "red",
+            "not_owned": "dim",
         }
 
-        for month, weeks in months.items():
+        for month, entries in months.items():
             text.append(f"  {month:12s}", style="bold")
-            for week in weeks:
-                if week in week_status:
-                    status, team = week_status[week]
-                    color = status_colors.get(status, "dim")
-                    text.append(" ██", style=color)
-                else:
-                    text.append(" ██", style="dim")  # not owned
+            for entry in entries:
+                color = status_colors.get(entry["status"], "dim")
+                text.append(" ██", style=color)
+            # Show summary stats for the month
+            month_stats: dict[str, str] = {}
+            for entry in entries:
+                if entry["status"] != "not_owned":
+                    _acc(month_stats, entry.get("stats", {}))
+            if month_stats:
+                scored = [c for c in self.categories
+                          if not c.is_only_display and c.position_type == "B"]
+                text.append("  ", style="dim")
+                for cat in scored[:6]:  # show first 6 cats to fit
+                    val = month_stats.get(cat.stat_id, "")
+                    if val:
+                        text.append(f"{cat.display_name}:{val} ", style="dim")
             text.append("\n")
 
         text.append("\n  ")
@@ -2647,6 +2652,27 @@ class PlayerExplorerScreen(Screen):
         text.append(" Not Owned\n\n")
 
         widget.update(text)
+
+
+def _acc(target: dict, source: dict) -> None:
+    """Accumulate counting stats from source into target."""
+    for sid, val in source.items():
+        if sid in ("3", "4", "5"):
+            continue
+        val = str(val)
+        if "/" in val:
+            existing = target.get(sid, "0/0")
+            e_parts = str(existing).split("/")
+            v_parts = val.split("/")
+            try:
+                target[sid] = f"{int(e_parts[0])+int(v_parts[0])}/{int(e_parts[1])+int(v_parts[1])}"
+            except (ValueError, IndexError):
+                pass
+        else:
+            try:
+                target[sid] = str(int(target.get(sid, 0)) + int(val))
+            except (ValueError, TypeError):
+                pass
 
 
 # --- Transactions Screen ---
