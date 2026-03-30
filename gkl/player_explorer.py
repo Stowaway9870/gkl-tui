@@ -184,22 +184,17 @@ def compute_stint_stats(
 ) -> StintStats:
     """Compute aggregated stats for a stint, split by started/benched."""
     result = StintStats()
-    started_weeks = 0
-    benched_weeks = 0
 
     for week, (sel_pos, stats) in stint.week_data.items():
         usage = classify_position(sel_pos)
         if usage == "started":
-            started_weeks += 1
+            result.started_days += 1
             _add_stats(result.started_stats, stats, batting_stat_ids)
         elif usage == "benched":
-            benched_weeks += 1
+            result.benched_days += 1
             _add_stats(result.benched_stats, stats, batting_stat_ids)
         _add_stats(result.total_stats, stats, batting_stat_ids)
 
-    # Approximate days from weeks (7 days per week)
-    result.started_days = started_weeks * 7
-    result.benched_days = benched_weeks * 7
     result.total_days = stint.days
 
     return result
@@ -217,13 +212,13 @@ def compute_usage_summary(
         for week, (sel_pos, stats) in stint.week_data.items():
             usage = classify_position(sel_pos)
             if usage == "started":
-                summary.started_days += 7
+                summary.started_days += 1
                 _add_stats(summary.started_stats, stats, batting_stat_ids)
             elif usage == "benched":
-                summary.benched_days += 7
+                summary.benched_days += 1
                 _add_stats(summary.benched_stats, stats, batting_stat_ids)
             elif usage == "il":
-                summary.il_days += 7
+                summary.il_days += 1
                 _add_stats(summary.il_stats, stats, batting_stat_ids)
 
     owned_days = sum(s.days for s in stints)

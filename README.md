@@ -86,6 +86,28 @@ Search pulls from the Yahoo Fantasy API and caches roster data locally for fast 
 
 ![Player Explorer](docs/screenshots/player-explorer.png)
 
+### Watchlist
+
+Track free agents you're interested in and compare them head-to-head against players on any team's roster.
+
+**Adding players:** From the Free Agents screen (`f`), highlight a player and press `w` to add or remove them from your watchlist.
+
+**Viewing the watchlist:** Press `l` from the main screen to see all watchlisted players with full stats, Statcast metrics, SGP values, and Yahoo rankings.
+
+![Watchlist](docs/screenshots/watchlist.png)
+
+### Player Comparison
+
+From the Watchlist screen, highlight a player and press `c` to compare them against a fantasy team's roster:
+
+- **Position matching:** Automatically finds all roster players who share the same position(s) as the watchlisted player
+- **Side-by-side stats:** League stats and Statcast metrics for both the watchlisted player and each roster player
+- **Delta rows:** The difference for every stat between the two players — green means the watchlisted player is better, red means worse
+- **SGP delta:** Net standings gain/loss if you made the swap — the most actionable number for roster decisions
+- **Directional awareness:** Correctly handles stats where lower is better (ERA, WHIP for pitchers) vs. higher is better (HR, RBI, K%)
+
+![Player Comparison](docs/screenshots/comparison.png)
+
 ### MLB Live Scoreboard
 
 Real-time MLB game scores and linescore data pulled from the MLB Stats API. Shows today's games with current inning, score, and pitching matchups.
@@ -156,6 +178,7 @@ From the main scoreboard:
 | `f` | Free Agents |
 | `x` | Transactions |
 | `p` | Player Explorer |
+| `l` | Watchlist |
 | `g` | MLB Scoreboard |
 | `w` | Weekly stats view |
 | `d` | Daily stats view |
