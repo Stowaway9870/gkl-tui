@@ -84,7 +84,7 @@ Search pulls from the Yahoo Fantasy API and caches roster data locally for fast 
 
 **Key binding:** `p` from main screen
 
-![Player Explorer](docs/screenshots/player-explorer.png)
+![Player Explorer](docs/screenshots/player-explorer.svg)
 
 ### Watchlist
 
@@ -94,7 +94,7 @@ Track free agents you're interested in and compare them head-to-head against pla
 
 **Viewing the watchlist:** Press `l` from the main screen to see all watchlisted players with full stats, Statcast metrics, SGP values, and Yahoo rankings.
 
-![Watchlist](docs/screenshots/watchlist.png)
+![Watchlist](docs/screenshots/watchlist.svg)
 
 ### Player Comparison
 
@@ -106,7 +106,7 @@ From the Watchlist screen, highlight a player and press `c` to compare them agai
 - **SGP delta:** Net standings gain/loss if you made the swap — the most actionable number for roster decisions
 - **Directional awareness:** Correctly handles stats where lower is better (ERA, WHIP for pitchers) vs. higher is better (HR, RBI, K%)
 
-![Player Comparison](docs/screenshots/comparison.png)
+![Player Comparison](docs/screenshots/comparison.svg)
 
 ### MLB Live Scoreboard
 
