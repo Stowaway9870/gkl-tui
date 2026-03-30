@@ -2476,12 +2476,9 @@ class PlayerExplorerScreen(Screen):
     def _render_usage_summary(
         self, widget: Static, usage: dict, total_weeks: int,
     ) -> None:
-        """Render the usage summary (started %, benched %, IL %, not owned %)."""
+        """Render the usage summary with per-category stat breakdowns."""
         scored = [c for c in self.categories if not c.is_only_display]
         bat_cats = [c for c in scored if c.position_type == "B"]
-
-        text = Text()
-        text.append("\n")
 
         sections = [
             ("STARTED", usage["started"], "bold green"),
@@ -2490,24 +2487,40 @@ class PlayerExplorerScreen(Screen):
             ("NOT OWNED", usage["not_owned"], "dim"),
         ]
 
+        # Compute rate stats for each section
+        for _, data, _ in sections:
+            stats = data.get("stats", {})
+            if stats:
+                _compute_rates(stats)
+
+        text = Text()
+        text.append("\n")
+
+        # Header line: percentage + label + weeks for each section
+        col_width = 28
         for label, data, style in sections:
             weeks = data["weeks"]
             pct = round(weeks / max(1, total_weeks) * 100)
-            text.append(f"  {pct}%", style=style)
-            text.append(f" {label}", style="bold")
-            text.append(f"  ({weeks} of {total_weeks} weeks)  ", style="dim")
+            cell = f"  {pct}% {label}"
+            text.append(cell.ljust(col_width), style=style)
+        text.append("\n")
 
+        # Sub-header: weeks count
+        for label, data, style in sections:
+            weeks = data["weeks"]
+            cell = f"  {weeks} of {total_weeks} total weeks"
+            text.append(cell.ljust(col_width), style="dim")
         text.append("\n\n")
 
-        # Show stats per usage type
-        for label, data, style in sections:
-            stats = data.get("stats", {})
-            if not stats:
-                continue
-            text.append(f"  {label}: ", style="bold")
-            for cat in bat_cats:
+        # Stat rows: one row per category, columns side by side
+        for cat in bat_cats:
+            for label, data, style in sections:
+                stats = data.get("stats", {})
                 val = stats.get(cat.stat_id, "-")
-                text.append(f"{cat.display_name}:{val} ", style="dim")
+                if not val:
+                    val = "-"
+                cell = f"  {cat.display_name:8s} {val:>8s}"
+                text.append(cell.ljust(col_width))
             text.append("\n")
 
         text.append("\n")
@@ -2574,6 +2587,11 @@ class PlayerExplorerScreen(Screen):
                     _acc(benched_stats, stats)
                 _acc(total_stats, stats)
 
+            # Compute rate stats
+            _compute_rates(total_stats)
+            _compute_rates(started_stats)
+            _compute_rates(benched_stats)
+
             num_weeks = len(weeks)
             grand_total_weeks += num_weeks
             _acc(grand_total_stats, total_stats)
@@ -2621,6 +2639,7 @@ class PlayerExplorerScreen(Screen):
                 table.add_row(*row_b)
 
         # Grand total row
+        _compute_rates(grand_total_stats)
         if stints:
             row_t: list[Text] = [
                 Text("TOT".ljust(24), style="bold"),
@@ -2670,25 +2689,28 @@ class PlayerExplorerScreen(Screen):
             "not_owned": "dim",
         }
 
+        scored = [c for c in self.categories
+                  if not c.is_only_display and c.position_type == "B"]
+
         for month, entries in months.items():
             text.append(f"  {month:12s}", style="bold")
             for entry in entries:
                 color = status_colors.get(entry["status"], "dim")
                 text.append(" ██", style=color)
-            # Show summary stats for the month
+            text.append("\n")
+            # Show summary stats for the month on next line
             month_stats: dict[str, str] = {}
             for entry in entries:
                 if entry["status"] != "not_owned":
                     _acc(month_stats, entry.get("stats", {}))
             if month_stats:
-                scored = [c for c in self.categories
-                          if not c.is_only_display and c.position_type == "B"]
-                text.append("  ", style="dim")
-                for cat in scored[:6]:  # show first 6 cats to fit
+                _compute_rates(month_stats)
+                text.append("              ", style="dim")
+                for cat in scored:
                     val = month_stats.get(cat.stat_id, "")
                     if val:
                         text.append(f"{cat.display_name}:{val} ", style="dim")
-            text.append("\n")
+                text.append("\n")
 
         text.append("\n  ")
         text.append("██", style="green")
@@ -2722,6 +2744,34 @@ def _acc(target: dict, source: dict) -> None:
                 target[sid] = str(int(target.get(sid, 0)) + int(val))
             except (ValueError, TypeError):
                 pass
+
+
+def _compute_rates(stats: dict) -> None:
+    """Compute AVG, OBP, SLG from accumulated counting stats in-place."""
+    # Parse H and AB from stat 60 (H/AB format)
+    hab = stats.get("60", "0/0")
+    h, ab = 0.0, 0.0
+    if "/" in str(hab):
+        parts = str(hab).split("/")
+        try:
+            h = float(parts[0])
+            ab = float(parts[1])
+        except (ValueError, IndexError):
+            pass
+
+    # AVG (stat 3) = H / AB
+    stats["3"] = f"{h / ab:.3f}" if ab > 0 else ".000"
+
+    # OBP (stat 4) = (H + BB + HBP) / (AB + BB + HBP + SF)
+    bb = float(stats.get("18", 0))
+    hbp = float(stats.get("19", 0))
+    sf = float(stats.get("20", 0))
+    obp_denom = ab + bb + hbp + sf
+    stats["4"] = f"{(h + bb + hbp) / obp_denom:.3f}" if obp_denom > 0 else ".000"
+
+    # SLG (stat 5) - use raw value from Yahoo if present, otherwise skip
+    if "5" not in stats or stats["5"] in ("", "-"):
+        stats["5"] = "-"
 
 
 # --- Transactions Screen ---
