@@ -2657,92 +2657,127 @@ class PlayerExplorerScreen(Screen):
     def _render_timeline(
         self, widget: Static, timeline: list[dict],
     ) -> None:
-        """Render weekly season timeline with one block per fantasy matchup week.
+        """Render daily season timeline colored by fantasy team ownership.
 
-        Shows all weeks (including future), grouped by month.
-        Past weeks are colored by status; future weeks are shown as empty outlines.
+        One block per calendar day, colored by the fantasy team that owns
+        the player. Weeks spanning month boundaries split across months.
+        Shows stats and usage summary per month.
         """
-        from datetime import datetime
+        from datetime import datetime, timedelta
 
-        # Total weeks in a standard fantasy baseball season
-        total_season_weeks = 26
+        # Assign a unique color to each fantasy team
+        team_colors = [
+            "bright_cyan", "bright_yellow", "bright_green", "bright_magenta",
+            "bright_blue", "dark_orange", "medium_purple", "deep_pink",
+            "dodger_blue", "gold1", "spring_green", "coral",
+            "turquoise2", "orchid", "chartreuse3", "salmon",
+            "steel_blue", "khaki1",
+        ]
+        team_color_map: dict[str, str] = {}
+        color_idx = 0
 
-        # Build lookup from timeline data (which only covers current_week)
-        week_lookup: dict[int, dict] = {}
+        # Build day-by-day data from weekly timeline entries
+        day_data: dict[str, dict] = {}  # date_str -> {status, team_name, stats}
+
         for entry in timeline:
-            week_lookup[entry["week"]] = entry
+            ws = entry.get("week_start", "")
+            we = entry.get("week_end", "")
+            status = entry.get("status", "not_owned")
+            team_name = entry.get("team_name", "")
+            stats = entry.get("stats", {})
 
-        # Get week dates from the store for all available weeks
-        week_dates = self.api.get_week_dates(self.league.league_key)
+            if not ws or not we:
+                continue
 
-        status_colors = {
-            "started": "green",
-            "benched": "yellow",
-            "il": "red",
-            "not_owned": "dim",
-        }
+            try:
+                start = datetime.strptime(ws, "%Y-%m-%d")
+                end = datetime.strptime(we, "%Y-%m-%d")
+            except ValueError:
+                continue
+
+            # Assign color to team
+            if team_name and team_name not in team_color_map:
+                team_color_map[team_name] = team_colors[color_idx % len(team_colors)]
+                color_idx += 1
+
+            d = start
+            while d <= end:
+                day_data[d.strftime("%Y-%m-%d")] = {
+                    "status": status,
+                    "team_name": team_name,
+                    "stats": stats,
+                }
+                d += timedelta(days=1)
+
+        if not day_data:
+            widget.update(Text("  No timeline data available.\n", style="dim"))
+            return
 
         scored = [c for c in self.categories
                   if not c.is_only_display and c.position_type == "B"]
 
+        # Determine full season date range (use week_dates for future weeks)
+        all_dates = sorted(day_data.keys())
+        first_date = datetime.strptime(all_dates[0], "%Y-%m-%d")
+        # Extend to end of last known week or season
+        last_date = datetime.strptime(all_dates[-1], "%Y-%m-%d")
+
         text = Text()
         text.append("\n")
 
-        # Group weeks by month using week_start dates
-        months: list[tuple[str, list[int]]] = []  # (month_name, [week_nums])
-        current_month = ""
-        for w in range(1, total_season_weeks + 1):
-            if w in week_dates:
-                ws = week_dates[w][0]
-                try:
-                    month = datetime.strptime(ws, "%Y-%m-%d").strftime("%B")
-                except ValueError:
-                    month = f"Month {w // 4 + 1}"
-            else:
-                # Estimate month for future weeks without date data
-                month = f"Week {w}"
-                # Group remaining future weeks together
-                if not months or months[-1][0] != "Future":
-                    months.append(("Future", []))
-                months[-1][1].append(w)
-                continue
+        # Iterate month by month
+        import calendar
+        current = first_date.replace(day=1)
+        while current <= last_date:
+            month_name = current.strftime("%B")
+            days_in_month = calendar.monthrange(current.year, current.month)[1]
 
-            if month != current_month:
-                current_month = month
-                months.append((month, []))
-            months[-1][1].append(w)
-
-        for month_name, weeks in months:
             text.append(f"  {month_name:12s}", style="bold")
 
-            # One block per week
-            for w in weeks:
-                entry = week_lookup.get(w)
-                if entry and w <= self.league.current_week:
-                    status = entry.get("status", "not_owned")
-                    color = status_colors.get(status, "dim")
-                    text.append(" ██", style=color)
-                else:
-                    # Future week — show outline
-                    text.append(" ░░", style="dim")
-
-            text.append("\n")
-
-            # Week number labels
-            text.append("              ", style="dim")
-            for w in weeks:
-                text.append(f" {w:2d}", style="dim")
-            text.append("\n")
-
-            # Accumulate stats for this month's weeks
             month_stats: dict[str, str] = {}
-            for w in weeks:
-                entry = week_lookup.get(w)
-                if entry and entry.get("status") != "not_owned":
-                    stats = entry.get("stats", {})
-                    if stats:
-                        _acc(month_stats, stats)
+            started_count = 0
+            benched_count = 0
+            il_count = 0
+            other_roster_count = 0
+            not_owned_count = 0
+            weeks_seen: set[str] = set()  # track week_start to avoid double-counting stats
 
+            for day in range(1, days_in_month + 1):
+                d = current.replace(day=day)
+                ds = d.strftime("%Y-%m-%d")
+
+                if d > last_date:
+                    # Future day
+                    text.append("░", style="dim")
+                    continue
+
+                info = day_data.get(ds)
+                if not info or info["status"] == "not_owned":
+                    text.append("░", style="#555555")
+                    not_owned_count += 1
+                else:
+                    team = info["team_name"]
+                    color = team_color_map.get(team, "dim")
+                    text.append("█", style=color)
+
+                    status = info["status"]
+                    if status == "started":
+                        started_count += 1
+                    elif status == "benched":
+                        benched_count += 1
+                    elif status == "il":
+                        il_count += 1
+
+                # Accumulate stats once per week (on the week's start day)
+                if info and info["stats"] and d.weekday() == 0:
+                    week_key = f"{d.isocalendar()[1]}"
+                    if week_key not in weeks_seen and info["status"] != "not_owned":
+                        weeks_seen.add(week_key)
+                        _acc(month_stats, info["stats"])
+
+            text.append("\n")
+
+            # Stats line
             if month_stats:
                 _compute_rates(month_stats)
                 text.append("              ", style="dim")
@@ -2750,20 +2785,36 @@ class PlayerExplorerScreen(Screen):
                     val = month_stats.get(cat.stat_id, "")
                     if val:
                         text.append(f"{cat.display_name}:{val} ", style="dim")
+                # Usage summary
+                parts = []
+                if started_count:
+                    parts.append(f"{started_count} started")
+                if benched_count:
+                    parts.append(f"{benched_count} benched")
+                if il_count:
+                    parts.append(f"{il_count} IL")
+                if not_owned_count:
+                    parts.append(f"{not_owned_count} not owned")
+                if parts:
+                    text.append("  " + " / ".join(parts), style="dim")
                 text.append("\n")
 
             text.append("\n")
 
+            # Advance to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+
+        # Legend: show each team with its color
         text.append("  ")
-        text.append("██", style="green")
-        text.append(" Started  ")
-        text.append("██", style="yellow")
-        text.append(" Benched  ")
-        text.append("██", style="red")
-        text.append(" IL/NA  ")
-        text.append("██", style="dim")
+        for team, color in team_color_map.items():
+            text.append("█", style=color)
+            text.append(f" {team}  ")
+        text.append("░", style="#555555")
         text.append(" Not Owned  ")
-        text.append("░░", style="dim")
+        text.append("░", style="dim")
         text.append(" Future\n\n")
 
         widget.update(text)
