@@ -358,6 +358,8 @@ class YahooFantasyAPI:
             pass
         return players, total
 
+    _roster_debug_dumped = False
+
     def _parse_roster_players(self, data: dict) -> list[PlayerStats]:
         """Parse player list from a roster response."""
         players: list[PlayerStats] = []
@@ -368,6 +370,15 @@ class YahooFantasyAPI:
             count = int(players_data.get("count", 0))
             for i in range(count):
                 p_wrapper = players_data[str(i)]["player"]
+                # One-time debug dump of roster player data
+                if not YahooFantasyAPI._roster_debug_dumped:
+                    YahooFantasyAPI._roster_debug_dumped = True
+                    try:
+                        Path("/tmp/yahoo_roster_player_debug.json").write_text(
+                            json.dumps(p_wrapper, indent=2, default=str)
+                        )
+                    except Exception:
+                        pass
                 players.append(self._parse_player(p_wrapper))
         except (KeyError, IndexError, TypeError):
             pass
@@ -426,6 +437,16 @@ class YahooFantasyAPI:
                         cost = da.get("average_cost", da.get("cost", ""))
                         if cost:
                             draft_cost = str(cost)
+                # selected_position may appear as a top-level element
+                # in roster responses (not inside the metadata list)
+                if "selected_position" in elem and not selected_position:
+                    sp = elem["selected_position"]
+                    if isinstance(sp, list):
+                        for sp_item in sp:
+                            if isinstance(sp_item, dict) and "position" in sp_item:
+                                selected_position = sp_item["position"]
+                    elif isinstance(sp, dict):
+                        selected_position = sp.get("position", "")
 
         return PlayerStats(
             player_key=player_key,

@@ -2198,6 +2198,7 @@ class PlayerSearchModal(Screen):
         super().__init__()
         self.api = api
         self.league = league
+        self._store = RosterDataStore()
 
     def compose(self) -> ComposeResult:
         with Vertical(id="ps-container"):
@@ -2212,9 +2213,57 @@ class PlayerSearchModal(Screen):
         query = event.value.strip()
         if not query:
             return
-        results = self.api.search_players(self.league.league_key, query, count=10)
         lv = self.query_one("#ps-results", ListView)
         lv.clear()
+
+        # Try Yahoo API first, fall back to local SQLite cache
+        results: list[PlayerStats] = []
+        try:
+            results = self.api.search_players(
+                self.league.league_key, query, count=10,
+            )
+        except Exception:
+            pass
+
+        if not results:
+            # Fuzzy search from local cache: try each word separately
+            cache_results = self._store.search_players(
+                self.league.league_key, query,
+            )
+            if not cache_results:
+                # Try each word individually for fuzzy matching
+                for word in query.split():
+                    if len(word) >= 2:
+                        cache_results.extend(
+                            self._store.search_players(
+                                self.league.league_key, word,
+                            )
+                        )
+                # Deduplicate
+                seen: set[str] = set()
+                deduped: list[dict] = []
+                for r in cache_results:
+                    if r["player_key"] not in seen:
+                        seen.add(r["player_key"])
+                        deduped.append(r)
+                cache_results = deduped[:10]
+
+            for r in cache_results:
+                p = PlayerStats(
+                    player_key=r["player_key"],
+                    name=r["player_name"],
+                    position=r.get("player_position", ""),
+                    team_abbr="",
+                )
+                item = ListItem(
+                    Label(f"{p.name} — {p.position}")
+                )
+                item._player = p  # type: ignore[attr-defined]
+                lv.append(item)
+            if not cache_results:
+                lv.append(ListItem(Label("No results found.")))
+            return
+
         for p in results:
             item = ListItem(
                 Label(f"{p.name} — {p.position} — {p.team_abbr}")
