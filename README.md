@@ -1,4 +1,4 @@
-# GKL CLI — Fantasy Baseball Command Center
+# GKL TUI — Fantasy Baseball Command Center
 
 A terminal-based application for Yahoo Fantasy Baseball leagues. Combines league data, advanced analytics, and real-time MLB scores into a single interface you can run from any terminal.
 
