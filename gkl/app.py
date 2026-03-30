@@ -31,6 +31,11 @@ from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
 )
+from gkl.player_explorer import (
+    build_ownership_timeline, map_weeks_to_stints, load_stint_roster_data,
+    compute_stint_stats, compute_usage_summary, classify_position,
+    OwnershipStint, UsageSummary, StintStats,
+)
 from gkl.mlb_api import MLBGame, get_mlb_scoreboard
 from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
@@ -2170,6 +2175,480 @@ class FreeAgentScreen(Screen):
         self.app.pop_screen()
 
 
+# --- Player Explorer Screen ---
+
+
+class PlayerSearchModal(Screen):
+    """Modal for searching and selecting a player."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    #ps-container {
+        align: center middle;
+        width: 60;
+        height: 20;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #ps-input {
+        margin: 0 0 1 0;
+    }
+    #ps-results {
+        height: 1fr;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ps-container"):
+            yield Static("Search for a player:", id="ps-label")
+            yield Input(placeholder="Player name...", id="ps-input")
+            yield ListView(id="ps-results")
+
+    def on_mount(self) -> None:
+        self.query_one("#ps-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        query = event.value.strip()
+        if not query:
+            return
+        results = self.api.search_players(self.league.league_key, query, count=10)
+        lv = self.query_one("#ps-results", ListView)
+        lv.clear()
+        for p in results:
+            item = ListItem(
+                Label(f"{p.name} — {p.position} — {p.team_abbr}")
+            )
+            item._player = p  # type: ignore[attr-defined]
+            lv.append(item)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        player = getattr(event.item, "_player", None)
+        if player:
+            self.dismiss(player)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class PlayerExplorerScreen(Screen):
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+    ]
+    CSS = """
+    #pe-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #pe-player-info {
+        height: 3;
+        padding: 0 1;
+        background: $surface;
+    }
+    #pe-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #pe-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #pe-spinner {
+        height: 3;
+    }
+    #pe-scroll {
+        height: 1fr;
+    }
+    .pe-section-header {
+        height: 1;
+        content-align: left middle;
+        background: #2A2A2A;
+        color: $text-muted;
+        text-style: bold;
+        padding: 0 1;
+    }
+    .pe-table {
+        height: auto;
+        max-height: 40%;
+        background: $panel;
+    }
+    .pe-usage-bar {
+        height: auto;
+        padding: 0 1;
+        background: $panel;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    def __init__(self, api: YahooFantasyAPI, league: League,
+                 categories: list[StatCategory],
+                 player: PlayerStats | None = None) -> None:
+        super().__init__()
+        self.api = api
+        self.league = league
+        self.categories = categories
+        self._player = player
+        self._transactions: list[Transaction] = []
+        self._stints: list[OwnershipStint] = []
+        self._week_dates: dict[int, tuple[str, str]] = {}
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Static("", id="pe-header")
+        yield Static("", id="pe-player-info")
+        with Vertical(id="pe-loading-container"):
+            yield LoadingIndicator(id="pe-spinner")
+            yield Static("Loading player data...", id="pe-loading-status")
+        yield VerticalScroll(id="pe-scroll")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        header = self.query_one("#pe-header", Static)
+        header.update(f" {self.league.name} — Player Explorer ")
+        if self._player:
+            self._start_load()
+        else:
+            self.app.push_screen(
+                PlayerSearchModal(self.api, self.league),
+                callback=self._on_player_selected,
+            )
+
+    def _on_player_selected(self, player: PlayerStats | None) -> None:
+        if player is None:
+            self.app.pop_screen()
+            return
+        self._player = player
+        self._start_load()
+
+    def _start_load(self) -> None:
+        p = self._player
+        assert p is not None
+        info = self.query_one("#pe-player-info", Static)
+        info_text = Text()
+        info_text.append(f"\n {p.name}", style="bold")
+        info_text.append(f"  {p.position}", style="dim")
+        info_text.append(f"  {p.team_abbr}\n", style="dim")
+        info.update(info_text)
+        self.run_worker(self._load_player_data)
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    async def _show_loading(self, msg: str) -> None:
+        try:
+            self.query_one("#pe-loading-status", Static).update(msg)
+            self.query_one("#pe-loading-container").display = True
+            self.query_one("#pe-scroll").display = False
+        except Exception:
+            pass
+
+    def _hide_loading(self) -> None:
+        try:
+            self.query_one("#pe-loading-container").display = False
+            self.query_one("#pe-scroll").display = True
+        except Exception:
+            pass
+
+    async def _load_player_data(self) -> None:
+        p = self._player
+        assert p is not None
+
+        # 1. Get transactions
+        await self._show_loading("Fetching transaction history...")
+        self._transactions = self.api.get_transactions(
+            self.league.league_key, count=200,
+        )
+
+        # 2. Build ownership timeline
+        await self._show_loading("Building ownership timeline...")
+        self._stints = build_ownership_timeline(
+            p.player_key, self._transactions,
+        )
+
+        # 3. Get week date ranges
+        await self._show_loading("Loading week schedule...")
+        self._week_dates = self.api.get_week_dates(self.league.league_key)
+
+        # 4. Map weeks to stints
+        if self._week_dates:
+            map_weeks_to_stints(self._stints, self._week_dates)
+
+        # 5. Load roster data for each stint's weeks
+        total_weeks = sum(len(s.weeks) for s in self._stints)
+        loaded = 0
+        for stint in self._stints:
+            for week in stint.weeks:
+                loaded += 1
+                await self._show_loading(
+                    f"Loading roster data... ({loaded}/{total_weeks})"
+                )
+                try:
+                    players = self.api.get_roster_stats(stint.team_key, week)
+                    for rp in players:
+                        if rp.player_key == p.player_key:
+                            stint.week_data[week] = (
+                                rp.selected_position, rp.stats,
+                            )
+                            break
+                except Exception:
+                    continue
+
+        # 6. Render all sections
+        await self._show_loading("Rendering player analysis...")
+        scroll = self.query_one("#pe-scroll", VerticalScroll)
+        await scroll.remove_children()
+
+        # --- Usage Summary ---
+        label1 = Static(
+            " Season Usage Summary with Performance",
+            classes="pe-section-header",
+        )
+        usage_widget = Static("", classes="pe-usage-bar")
+        await scroll.mount(label1, usage_widget)
+        self._render_usage_summary(usage_widget)
+
+        # --- Roster Breakdown by Team ---
+        label2 = Static(
+            " Roster Breakdown by Team",
+            classes="pe-section-header",
+        )
+        table2 = DataTable(classes="pe-table")
+        await scroll.mount(label2, table2)
+        self._render_roster_breakdown(table2)
+
+        # --- Season Timeline ---
+        label3 = Static(
+            " Season Timeline",
+            classes="pe-section-header",
+        )
+        timeline_widget = Static("", classes="pe-usage-bar")
+        await scroll.mount(label3, timeline_widget)
+        self._render_timeline(timeline_widget)
+
+        self._hide_loading()
+
+    def _render_usage_summary(self, widget: Static) -> None:
+        """Render the usage summary (started %, benched %, IL %, not owned %)."""
+        scored = [c for c in self.categories if not c.is_only_display]
+        bat_ids = [c.stat_id for c in scored if c.position_type == "B"]
+
+        season_days = 195  # approximate MLB season length
+        summary = compute_usage_summary(
+            self._stints, season_days, bat_ids,
+        )
+
+        text = Text()
+        text.append("\n")
+
+        sections = [
+            ("STARTED", summary.started_days, summary.started_stats, "bold green"),
+            ("BENCHED", summary.benched_days, summary.benched_stats, "bold yellow"),
+            ("IL / NA", summary.il_days, summary.il_stats, "bold magenta"),
+            ("NOT OWNED", summary.not_owned_days, summary.not_owned_stats, "dim"),
+        ]
+
+        for label, days, stats, style in sections:
+            pct = round(days / max(1, summary.total_days) * 100)
+            text.append(f"  {pct}%", style=style)
+            text.append(f" {label}", style="bold")
+            text.append(f"  ({days} of {summary.total_days} days)  ", style="dim")
+
+        text.append("\n\n")
+
+        # Show stats for each usage type
+        scored_bat = [c for c in scored if c.position_type == "B"]
+        for label, days, stats, style in sections:
+            if not stats:
+                continue
+            text.append(f"  {label}: ", style="bold")
+            for cat in scored_bat:
+                val = stats.get(cat.stat_id, "-")
+                text.append(f"{cat.display_name}:{val} ", style="dim")
+            text.append("\n")
+
+        text.append("\n")
+        widget.update(text)
+
+    def _render_roster_breakdown(self, table: DataTable) -> None:
+        """Render the per-team stats breakdown table (Image 9 reference)."""
+        scored = [c for c in self.categories if not c.is_only_display]
+        bat_cats = [c for c in scored if c.position_type == "B"]
+        bat_ids = [c.stat_id for c in bat_cats]
+
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        cols = ["Team".ljust(24), "Status", "Dates", "Days"]
+        for cat in bat_cats:
+            cols.append(cat.display_name)
+        table.add_columns(*cols)
+
+        grand_total = StintStats()
+
+        for stint in self._stints:
+            stint_stats = compute_stint_stats(stint, bat_ids)
+
+            # Total row for this team
+            row: list[Text] = [
+                Text(stint.team_name[:24].ljust(24), style="bold"),
+                Text("Total", style="bold"),
+                Text(stint.date_range_str, style="dim"),
+                Text(str(stint.days), justify="right"),
+            ]
+            for cat in bat_cats:
+                row.append(Text(stint_stats.total_stats.get(cat.stat_id, "-"),
+                                justify="right"))
+            table.add_row(*row)
+
+            # Started sub-row
+            if stint_stats.started_days > 0:
+                row_s: list[Text] = [
+                    Text("", style="dim"),
+                    Text("  Started", style="dim"),
+                    Text(""),
+                    Text(str(stint_stats.started_days), justify="right", style="dim"),
+                ]
+                for cat in bat_cats:
+                    row_s.append(Text(
+                        stint_stats.started_stats.get(cat.stat_id, "-"),
+                        justify="right", style="dim",
+                    ))
+                table.add_row(*row_s)
+
+            # Benched sub-row
+            if stint_stats.benched_days > 0:
+                row_b: list[Text] = [
+                    Text("", style="dim"),
+                    Text("  Benched", style="dim"),
+                    Text(""),
+                    Text(str(stint_stats.benched_days), justify="right", style="dim"),
+                ]
+                for cat in bat_cats:
+                    row_b.append(Text(
+                        stint_stats.benched_stats.get(cat.stat_id, "-"),
+                        justify="right", style="dim",
+                    ))
+                table.add_row(*row_b)
+
+            # Accumulate grand total
+            for sid in bat_ids:
+                val = stint_stats.total_stats.get(sid, "0")
+                if "/" in val:
+                    e = grand_total.total_stats.get(sid, "0/0").split("/")
+                    v = val.split("/")
+                    try:
+                        grand_total.total_stats[sid] = (
+                            f"{int(e[0])+int(v[0])}/{int(e[1])+int(v[1])}"
+                        )
+                    except (ValueError, IndexError):
+                        pass
+                else:
+                    try:
+                        cur = int(grand_total.total_stats.get(sid, "0"))
+                        grand_total.total_stats[sid] = str(cur + int(val))
+                    except ValueError:
+                        pass
+            grand_total.total_days += stint.days
+
+        # Grand total row
+        if self._stints:
+            total_days = grand_total.total_days
+            first_date = self._stints[0].start_date if self._stints else ""
+            last_date = self._stints[-1].end_date or "present"
+            from datetime import datetime
+            if first_date:
+                fd = datetime.strptime(first_date, "%Y-%m-%d").strftime("%b %d")
+            else:
+                fd = ""
+            if last_date != "present":
+                ld = datetime.strptime(last_date, "%Y-%m-%d").strftime("%b %d")
+            else:
+                ld = "present"
+
+            row_t: list[Text] = [
+                Text("TOT".ljust(24), style="bold"),
+                Text("Total", style="bold"),
+                Text(f"{fd} - {ld}", style="dim"),
+                Text(str(total_days), justify="right", style="bold"),
+            ]
+            for cat in bat_cats:
+                row_t.append(Text(
+                    grand_total.total_stats.get(cat.stat_id, "-"),
+                    justify="right", style="bold",
+                ))
+            table.add_row(*row_t)
+
+    def _render_timeline(self, widget: Static) -> None:
+        """Render a text-based season timeline showing ownership by month."""
+        if not self._stints or not self._week_dates:
+            widget.update(Text("  No timeline data available.\n", style="dim"))
+            return
+
+        from datetime import datetime, timedelta
+
+        text = Text()
+        text.append("\n")
+
+        # Build week-by-week status
+        week_status: dict[int, tuple[str, str]] = {}  # week -> (status, team_name)
+        for stint in self._stints:
+            for week, (sel_pos, _stats) in stint.week_data.items():
+                usage = classify_position(sel_pos)
+                week_status[week] = (usage, stint.team_name)
+
+        # Group weeks by month
+        months: dict[str, list[int]] = {}
+        for week in sorted(self._week_dates.keys()):
+            start_str = self._week_dates[week][0]
+            month = datetime.strptime(start_str, "%Y-%m-%d").strftime("%B")
+            if month not in months:
+                months[month] = []
+            months[month].append(week)
+
+        status_colors = {
+            "started": "green",
+            "benched": "yellow",
+            "il": "red",
+        }
+
+        for month, weeks in months.items():
+            text.append(f"  {month:12s}", style="bold")
+            for week in weeks:
+                if week in week_status:
+                    status, team = week_status[week]
+                    color = status_colors.get(status, "dim")
+                    text.append(" ██", style=color)
+                else:
+                    text.append(" ██", style="dim")  # not owned
+            text.append("\n")
+
+        text.append("\n  ")
+        text.append("██", style="green")
+        text.append(" Started  ")
+        text.append("██", style="yellow")
+        text.append(" Benched  ")
+        text.append("██", style="red")
+        text.append(" IL/NA  ")
+        text.append("██", style="dim")
+        text.append(" Not Owned\n\n")
+
+        widget.update(text)
+
+
 # --- Transactions Screen ---
 
 
@@ -2640,6 +3119,7 @@ class ScoreboardScreen(Screen):
                 ("t", "roster", "Roster"),
                 ("f", "free_agents", "Free Agents"),
                 ("x", "transactions", "Transactions"),
+                ("p", "player_explorer", "Player Explorer"),
                 ("w", "view_weekly", "Weekly"), ("d", "view_daily", "Daily"),
                 ("n", "view_season", "Season"),
                 ("comma", "prev_date", "< Prev Day"),
@@ -3193,6 +3673,12 @@ class ScoreboardScreen(Screen):
         if self.league:
             self.app.push_screen(
                 TransactionsScreen(self.api, self.league, self.categories)
+            )
+
+    def action_player_explorer(self) -> None:
+        if self.league:
+            self.app.push_screen(
+                PlayerExplorerScreen(self.api, self.league, self.categories)
             )
 
     def action_mlb_scores(self) -> None:

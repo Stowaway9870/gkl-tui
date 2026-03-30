@@ -63,6 +63,8 @@ class TransactionPlayer:
     action: str  # "added", "dropped", "traded"
     from_team: str  # fantasy team name (or "Free Agents"/"Waivers")
     to_team: str  # fantasy team name (or "Free Agents"/"Waivers")
+    from_team_key: str = ""
+    to_team_key: str = ""
 
 
 @dataclass
@@ -83,6 +85,7 @@ class PlayerStats:
     team_abbr: str
     stats: dict[str, str] = field(default_factory=dict)  # stat_id -> value
     draft_cost: str = ""  # auction draft cost if available
+    selected_position: str = ""  # roster slot (e.g. "SS", "BN", "IL", "NA")
 
 
 class YahooFantasyAPI:
@@ -277,6 +280,67 @@ class YahooFantasyAPI:
             pass
         return ranks
 
+    def get_week_dates(self, league_key: str) -> dict[int, tuple[str, str]]:
+        """Get start/end dates for each week. Returns {week: (start, end)}. Cached."""
+        if not hasattr(self, "_week_dates_cache"):
+            self._week_dates_cache: dict[str, dict[int, tuple[str, str]]] = {}
+        if league_key in self._week_dates_cache:
+            return self._week_dates_cache[league_key]
+
+        week_dates: dict[int, tuple[str, str]] = {}
+        try:
+            data = self._get(f"league/{league_key}/settings")
+            settings = data["league"][1]["settings"]
+            for item in settings:
+                if isinstance(item, dict) and "roster_positions" in item:
+                    continue
+                if isinstance(item, dict) and "stat_categories" in item:
+                    continue
+        except (KeyError, IndexError, TypeError):
+            pass
+
+        # Fall back to scoreboard if settings doesn't work
+        if not week_dates:
+            # Get current week to know how many weeks exist
+            try:
+                data = self._get(f"league/{league_key}")
+                current_week = int(data["league"][0].get("current_week", 1))
+                for w in range(1, current_week + 1):
+                    matchups = self.get_scoreboard(league_key, week=w)
+                    if matchups:
+                        week_dates[w] = (matchups[0].week_start, matchups[0].week_end)
+            except (KeyError, IndexError, TypeError):
+                pass
+
+        self._week_dates_cache[league_key] = week_dates
+        return week_dates
+
+    def search_players(
+        self, league_key: str, query: str, count: int = 10,
+    ) -> list[PlayerStats]:
+        """Search for players by name across all statuses."""
+        players, _ = self.get_free_agents(
+            league_key, status=None, search=query,
+            stat_type="season", count=count,
+        )
+        return players
+
+    def get_player_weekly_stats(
+        self, league_key: str, player_key: str, week: int,
+    ) -> PlayerStats | None:
+        """Get a specific player's stats for a given week."""
+        try:
+            players, _ = self.get_free_agents(
+                league_key, status=None,
+                stat_type="week", sort=None, sort_type=None,
+                count=1,
+            )
+            # This approach won't work for specific player + week.
+            # Instead use the roster endpoint if we know the team.
+            return None
+        except Exception:
+            return None
+
     def _parse_free_agent_players(self, data: dict) -> tuple[list[PlayerStats], int]:
         """Parse player list from a league/players (free agent) response."""
         players: list[PlayerStats] = []
@@ -318,6 +382,7 @@ class YahooFantasyAPI:
         team_abbr = ""
         stats: dict[str, str] = {}
 
+        selected_position = ""
         if isinstance(player_wrapper[0], list):
             for item in player_wrapper[0]:
                 if isinstance(item, dict):
@@ -330,6 +395,14 @@ class YahooFantasyAPI:
                         position = item["display_position"]
                     if "editorial_team_abbr" in item:
                         team_abbr = item["editorial_team_abbr"]
+                    if "selected_position" in item:
+                        sp = item["selected_position"]
+                        if isinstance(sp, list):
+                            for sp_item in sp:
+                                if isinstance(sp_item, dict) and "position" in sp_item:
+                                    selected_position = sp_item["position"]
+                        elif isinstance(sp, dict):
+                            selected_position = sp.get("position", "")
 
         # Stats and draft analysis are in later elements
         draft_cost = ""
@@ -361,6 +434,7 @@ class YahooFantasyAPI:
             team_abbr=team_abbr,
             stats=stats,
             draft_cost=draft_cost,
+            selected_position=selected_position,
         )
 
     def get_draft_results(self, league_key: str) -> dict[str, str]:
@@ -446,6 +520,8 @@ class YahooFantasyAPI:
                         action = tx_detail.get("type", "")
                         src = tx_detail.get("source_team_name", "")
                         dst = tx_detail.get("destination_team_name", "")
+                        src_key = tx_detail.get("source_team_key", "")
+                        dst_key = tx_detail.get("destination_team_key", "")
                         if not src:
                             src = tx_detail.get("source_type", "")
                         if not dst:
@@ -459,6 +535,8 @@ class YahooFantasyAPI:
                             action=action,
                             from_team=src,
                             to_team=dst,
+                            from_team_key=src_key,
+                            to_team_key=dst_key,
                         ))
 
                 transactions.append(Transaction(
