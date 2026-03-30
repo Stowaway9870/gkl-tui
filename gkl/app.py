@@ -2657,30 +2657,44 @@ class PlayerExplorerScreen(Screen):
     def _render_timeline(
         self, widget: Static, timeline: list[dict],
     ) -> None:
-        """Render week-by-week season timeline with colored blocks."""
+        """Render daily season timeline with colored blocks per calendar day."""
         if not timeline:
             widget.update(Text("  No timeline data available.\n", style="dim"))
             return
 
-        from datetime import datetime
+        from datetime import datetime, timedelta
+        import calendar
 
-        text = Text()
-        text.append("\n")
+        # Build a day-by-day status map from weekly data
+        day_status: dict[str, str] = {}  # "YYYY-MM-DD" -> status
+        day_stats: dict[str, dict] = {}  # "YYYY-MM-DD" -> stats (same for all days in week)
 
-        # Group by month
-        months: dict[str, list[dict]] = {}
         for entry in timeline:
             ws = entry.get("week_start", "")
-            if ws:
+            we = entry.get("week_end", "")
+            status = entry.get("status", "not_owned")
+            stats = entry.get("stats", {})
+            if ws and we:
                 try:
-                    month = datetime.strptime(ws, "%Y-%m-%d").strftime("%B")
+                    start = datetime.strptime(ws, "%Y-%m-%d")
+                    end = datetime.strptime(we, "%Y-%m-%d")
+                    d = start
+                    while d <= end:
+                        ds = d.strftime("%Y-%m-%d")
+                        day_status[ds] = status
+                        day_stats[ds] = stats
+                        d += timedelta(days=1)
                 except ValueError:
-                    month = f"Week {entry['week']}"
-            else:
-                month = f"Week {entry['week']}"
-            if month not in months:
-                months[month] = []
-            months[month].append(entry)
+                    pass
+
+        if not day_status:
+            widget.update(Text("  No timeline data available.\n", style="dim"))
+            return
+
+        # Determine date range
+        all_dates = sorted(day_status.keys())
+        first_date = datetime.strptime(all_dates[0], "%Y-%m-%d")
+        last_date = datetime.strptime(all_dates[-1], "%Y-%m-%d")
 
         status_colors = {
             "started": "green",
@@ -2692,41 +2706,87 @@ class PlayerExplorerScreen(Screen):
         scored = [c for c in self.categories
                   if not c.is_only_display and c.position_type == "B"]
 
-        for month, entries in months.items():
-            text.append(f"  {month:12s}", style="bold")
-            for entry in entries:
-                color = status_colors.get(entry["status"], "dim")
-                text.append(" ██", style=color)
+        text = Text()
+        text.append("\n")
+
+        # Iterate month by month
+        current = first_date.replace(day=1)
+        while current <= last_date:
+            month_name = current.strftime("%B")
+            days_in_month = calendar.monthrange(current.year, current.month)[1]
+
+            text.append(f"  {month_name:12s}", style="bold")
+
+            # One block per calendar day
+            month_stats_acc: dict[str, str] = {}
+            for day in range(1, days_in_month + 1):
+                d = current.replace(day=day)
+                if d > last_date:
+                    break
+                if d < first_date:
+                    continue
+                ds = d.strftime("%Y-%m-%d")
+                status = day_status.get(ds, "not_owned")
+                color = status_colors.get(status, "dim")
+                text.append("█", style=color)
+
             text.append("\n")
-            # Show summary stats for the month on next line
-            month_stats: dict[str, str] = {}
-            for entry in entries:
-                if entry["status"] != "not_owned":
-                    _acc(month_stats, entry.get("stats", {}))
-            if month_stats:
-                _compute_rates(month_stats)
+
+            # Accumulate month stats
+            for day in range(1, days_in_month + 1):
+                d = current.replace(day=day)
+                ds = d.strftime("%Y-%m-%d")
+                # Only accumulate once per week (use Monday or first day)
+                if d.weekday() == 0 or day == 1:
+                    stats = day_stats.get(ds, {})
+                    if stats and day_status.get(ds, "not_owned") != "not_owned":
+                        _acc(month_stats_acc, stats)
+
+            if month_stats_acc:
+                _compute_rates(month_stats_acc)
                 text.append("              ", style="dim")
                 for cat in scored:
-                    val = month_stats.get(cat.stat_id, "")
+                    val = month_stats_acc.get(cat.stat_id, "")
                     if val:
                         text.append(f"{cat.display_name}:{val} ", style="dim")
                 text.append("\n")
 
+            # Advance to next month
+            if current.month == 12:
+                current = current.replace(year=current.year + 1, month=1)
+            else:
+                current = current.replace(month=current.month + 1)
+
         text.append("\n  ")
-        text.append("██", style="green")
+        text.append("█", style="green")
         text.append(" Started  ")
-        text.append("██", style="yellow")
+        text.append("█", style="yellow")
         text.append(" Benched  ")
-        text.append("██", style="red")
+        text.append("█", style="red")
         text.append(" IL/NA  ")
-        text.append("██", style="dim")
+        text.append("█", style="dim")
         text.append(" Not Owned\n\n")
 
         widget.update(text)
 
 
 def _acc(target: dict, source: dict) -> None:
-    """Accumulate counting stats from source into target."""
+    """Accumulate counting stats from source into target.
+
+    Skips rate stats (3=AVG, 4=OBP) but tracks total bases for SLG
+    by computing TB = SLG * AB from each source's raw values.
+    """
+    # Track total bases for SLG computation
+    src_slg = str(source.get("5", ""))
+    src_hab = str(source.get("60", "0/0"))
+    if src_slg and src_slg not in ("-", "") and "/" in src_hab:
+        try:
+            src_ab = float(src_hab.split("/")[1])
+            tb = float(src_slg) * src_ab
+            target["_tb"] = str(float(target.get("_tb", 0)) + tb)
+        except (ValueError, IndexError):
+            pass
+
     for sid, val in source.items():
         if sid in ("3", "4", "5"):
             continue
@@ -2748,7 +2808,6 @@ def _acc(target: dict, source: dict) -> None:
 
 def _compute_rates(stats: dict) -> None:
     """Compute AVG, OBP, SLG from accumulated counting stats in-place."""
-    # Parse H and AB from stat 60 (H/AB format)
     hab = stats.get("60", "0/0")
     h, ab = 0.0, 0.0
     if "/" in str(hab):
@@ -2769,9 +2828,9 @@ def _compute_rates(stats: dict) -> None:
     obp_denom = ab + bb + hbp + sf
     stats["4"] = f"{(h + bb + hbp) / obp_denom:.3f}" if obp_denom > 0 else ".000"
 
-    # SLG (stat 5) - use raw value from Yahoo if present, otherwise skip
-    if "5" not in stats or stats["5"] in ("", "-"):
-        stats["5"] = "-"
+    # SLG (stat 5) = Total Bases / AB
+    tb = float(stats.get("_tb", 0))
+    stats["5"] = f"{tb / ab:.3f}" if ab > 0 else ".000"
 
 
 # --- Transactions Screen ---
