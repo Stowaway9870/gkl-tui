@@ -72,6 +72,20 @@ Explore transaction activity across the league with three views:
 
 ![Transactions](docs/screenshots/transactions.svg)
 
+### Player Explorer
+
+Deep-dive into any player's season across the entire league. Search by name to pull up a full ownership and performance breakdown:
+
+- **Usage Summary:** Percentage of weeks started, benched, on IL, or not owned — with aggregated stats for each category
+- **Team-by-Team Breakdown:** Stats for every fantasy team that rostered the player, split by weeks started vs. benched
+- **Season Timeline:** Month-by-month visual calendar colored by fantasy team ownership, with monthly stat rollups
+
+Search pulls from the Yahoo Fantasy API and caches roster data locally for fast repeat lookups.
+
+**Key binding:** `p` from main screen
+
+![Player Explorer](docs/screenshots/player-explorer.png)
+
 ### MLB Live Scoreboard
 
 Real-time MLB game scores and linescore data pulled from the MLB Stats API. Shows today's games with current inning, score, and pitching matchups.
@@ -141,6 +155,7 @@ From the main scoreboard:
 | `t` | Roster Analysis |
 | `f` | Free Agents |
 | `x` | Transactions |
+| `p` | Player Explorer |
 | `g` | MLB Scoreboard |
 | `w` | Weekly stats view |
 | `d` | Daily stats view |
