@@ -93,15 +93,24 @@ class YahooFantasyAPI:
         self.auth = auth
         self._stat_categories: dict[str, list[StatCategory]] = {}
 
-    def _get(self, path: str) -> dict:
+    def _get(self, path: str, retries: int = 2) -> dict:
         token = self.auth.get_token()
-        resp = httpx.get(
-            f"{BASE_URL}/{path}",
-            headers=token.auth_header(),
-            params={"format": "json"},
-        )
-        resp.raise_for_status()
-        return resp.json()["fantasy_content"]
+        for attempt in range(retries + 1):
+            try:
+                resp = httpx.get(
+                    f"{BASE_URL}/{path}",
+                    headers=token.auth_header(),
+                    params={"format": "json"},
+                    timeout=30.0,
+                )
+                resp.raise_for_status()
+                return resp.json()["fantasy_content"]
+            except (httpx.ConnectTimeout, httpx.ReadTimeout):
+                if attempt == retries:
+                    raise
+                import time
+                time.sleep(1)
+        raise RuntimeError("unreachable")
 
     def get_current_mlb_game_key(self) -> str:
         """Get the game key for the current MLB season."""
