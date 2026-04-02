@@ -29,6 +29,7 @@ class SharedDataCache:
         self.draft_results: dict[str, str] = {}
         self.rank_lookup: dict[str, int] = {}
         self.preseason_rank_lookup: dict[str, int] = {}
+        self.replacement_by_pos: dict[str, list[PlayerStats]] = {}
 
         # Week-level caches shared across Roto/H2H/Scoreboard prefetch
         self.week_team_stats: dict[int, list[TeamStats]] = {}
@@ -101,6 +102,7 @@ class SharedDataCache:
         for pos, players in results:
             replacement_by_pos[pos] = players
 
+        self.replacement_by_pos = replacement_by_pos
         self.sgp_calc = SGPCalculator(
             self.all_teams, categories, replacement_by_pos,
         )

@@ -1083,7 +1083,8 @@ class RosterAnalysisScreen(Screen):
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("m", "cycle_team", "Next Team"),
                 ("1", "view_season", "Season"), ("2", "view_l14", "L14"),
-                ("3", "view_l30", "L30")]
+                ("3", "view_l30", "L30"),
+                ("i", "player_detail", "Player Detail")]
     CSS = """
     #roster-header {
         height: 1;
@@ -1335,6 +1336,7 @@ class RosterAnalysisScreen(Screen):
             "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA",
         ])
         bat_table.add_columns(*bat_cols)
+        bat_table._players = batters  # type: ignore[attr-defined]
         for p in batters:
             actual_cost = self._draft_results.get(p.player_key, "")
             sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
@@ -1396,6 +1398,7 @@ class RosterAnalysisScreen(Screen):
             "K%p", "BB%p", "Whiff%p",
         ])
         pitch_table.add_columns(*pitch_cols)
+        pitch_table._players = pitchers  # type: ignore[attr-defined]
         for p in pitchers:
             actual_cost = self._draft_results.get(p.player_key, "")
             sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
@@ -1512,6 +1515,27 @@ class RosterAnalysisScreen(Screen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
+    def action_player_detail(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+        except Exception:
+            return
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+        p = players[row_idx]
+        cache = self.app.shared_cache
+        self.app.push_screen(PlayerDetailScreen(
+            p.name, p.position, p.team_abbr,
+            categories=self.categories,
+            all_teams=cache.all_teams if cache.is_loaded else None,
+            replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
+        ))
+
 
 # --- Free Agent Browser Screen ---
 
@@ -1529,6 +1553,7 @@ class FreeAgentScreen(Screen):
         ("right", "next_page", "Next Page"),
         ("left", "prev_page", "Prev Page"),
         ("w", "watchlist_toggle", "Watch"),
+        ("i", "player_detail", "Player Detail"),
     ]
     CSS = """
     #fa-header {
@@ -2185,6 +2210,27 @@ class FreeAgentScreen(Screen):
             )
             self.notify(f"Added {p.name} to watchlist")
 
+    def action_player_detail(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+        except Exception:
+            return
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+        p = players[row_idx]
+        cache = self.app.shared_cache
+        self.app.push_screen(PlayerDetailScreen(
+            p.name, p.position, p.team_abbr,
+            categories=self.categories,
+            all_teams=cache.all_teams if cache.is_loaded else None,
+            replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
+        ))
+
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
@@ -2198,6 +2244,7 @@ class WatchlistScreen(Screen):
         ("q", "go_back", "Back"),
         ("c", "compare", "Compare"),
         ("d", "remove_player", "Remove"),
+        ("i", "player_detail", "Player Detail"),
     ]
     CSS = """
     #wl-header {
@@ -2541,6 +2588,27 @@ class WatchlistScreen(Screen):
         self._store.remove_from_watchlist(self.league.league_key, p.player_key)
         self.notify(f"Removed {p.name} from watchlist")
         self.run_worker(self._load_watchlist)
+
+    def action_player_detail(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+        except Exception:
+            return
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+        p = players[row_idx]
+        cache = self.app.shared_cache
+        self.app.push_screen(PlayerDetailScreen(
+            p.name, p.position, p.team_abbr,
+            categories=self.categories,
+            all_teams=cache.all_teams if cache.is_loaded else None,
+            replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
+        ))
 
     def action_compare(self) -> None:
         try:
@@ -3639,6 +3707,629 @@ def _compute_rates(stats: dict) -> None:
     stats["5"] = f"{tb / ab:.3f}" if ab > 0 else ".000"
 
 
+# --- Player Detail Screen ---
+
+
+class PlayerDetailScreen(Screen):
+    """Multi-year player stats: tables + per-stat bar charts on one page."""
+
+    BINDINGS = [
+        ("escape", "go_back", "Back"),
+        ("q", "go_back", "Back"),
+        ("1", "charts_traditional", "Traditional Charts"),
+        ("2", "charts_statcast", "Statcast Charts"),
+    ]
+    CSS = """
+    #pd-header {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #pd-info {
+        height: 2;
+        padding: 0 1;
+        background: $surface;
+    }
+    #pd-controls {
+        height: 1;
+        padding: 0 1;
+        background: $panel;
+    }
+    #pd-loading-container {
+        height: auto;
+        content-align: center middle;
+        padding: 1 0;
+    }
+    #pd-loading-status {
+        height: 1;
+        content-align: center middle;
+        color: $text-muted;
+    }
+    #pd-spinner {
+        height: 3;
+    }
+    #pd-scroll {
+        height: 1fr;
+    }
+    .pd-table {
+        height: auto;
+        background: $panel;
+    }
+    .pd-section-label {
+        height: 1;
+        padding: 0 1;
+        color: $accent;
+        text-style: bold;
+    }
+    .pd-chart-row {
+        height: 12;
+    }
+    .pd-chart {
+        width: 1fr;
+    }
+    DataTable > .datatable--cursor {
+        background: #3A5A3A;
+        color: #E8E4DF;
+    }
+    """
+
+    # 8 chart slots arranged in 2 rows of 4
+    _CHART_COUNT = 8
+
+    # Map fantasy stat display names → chart attribute names
+    _DISPLAY_TO_ATTR: dict[str, str] = {
+        "HR": "hr", "RBI": "rbi", "R": "runs", "SB": "sb",
+        "AVG": "avg", "OBP": "obp", "SLG": "slg", "OPS": "ops",
+        "BB": "bb", "SO": "so", "H": "hits",
+        "W": "wins", "SV": "saves", "K": "so", "IP": "ip",
+        "ERA": "era", "WHIP": "whip",
+    }
+    # Rate stats whose team value is already an average (don't divide by roster)
+    _RATE_DISPLAY_NAMES = {"AVG", "OBP", "SLG", "OPS", "ERA", "WHIP", "K/BB"}
+
+    def __init__(
+        self,
+        player_name: str,
+        player_position: str,
+        player_team: str,
+        categories: list[StatCategory] | None = None,
+        all_teams: list[TeamStats] | None = None,
+        replacement_by_pos: dict[str, list[PlayerStats]] | None = None,
+    ) -> None:
+        super().__init__()
+        self._player_name = player_name
+        self._player_position = player_position
+        self._player_team = player_team
+        self._categories = categories or []
+        self._all_teams = all_teams or []
+        self._replacement_by_pos = replacement_by_pos or {}
+        self._mlbam_id: int | None = None
+        self._is_batter = self._check_is_batter()
+        self._chart_mode = "traditional"  # or "statcast"
+        # Data storage
+        self._batting_stats: dict = {}
+        self._pitching_stats: dict = {}
+        self._statcast_data: dict = {}
+        self._years: list[int] = []
+        # Reference lines
+        self._mlb_avg: dict[str, float] = {}        # MLB-wide average (statcast)
+        self._league_avg: dict[str, float] = {}      # fantasy league rostered avg
+        self._repl_avg: dict[str, float] = {}        # replacement level (free agents)
+
+    def _check_is_batter(self) -> bool:
+        batting = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF", "Util", "DH"}
+        return any(p.strip() in batting for p in self._player_position.split(","))
+
+    def _compute_fantasy_league_avg(self) -> dict[str, float]:
+        """Per-player average across rostered fantasy league teams."""
+        if not self._all_teams or not self._categories:
+            return {}
+        num_teams = len(self._all_teams)
+        roster_size = 14 if self._is_batter else 9
+        pos_type = "B" if self._is_batter else "P"
+        result: dict[str, float] = {}
+        for cat in self._categories:
+            if cat.is_only_display or cat.position_type != pos_type:
+                continue
+            attr = self._DISPLAY_TO_ATTR.get(cat.display_name)
+            if attr is None:
+                continue
+            values: list[float] = []
+            for team in self._all_teams:
+                try:
+                    values.append(float(team.stats.get(cat.stat_id, "0")))
+                except (ValueError, TypeError):
+                    continue
+            if not values:
+                continue
+            total = sum(values)
+            if cat.display_name in self._RATE_DISPLAY_NAMES:
+                result[attr] = total / len(values)
+            else:
+                result[attr] = total / (num_teams * roster_size)
+        return result
+
+    def _compute_replacement_avg(self) -> dict[str, float]:
+        """Per-stat average of top free agents (replacement level)."""
+        if not self._replacement_by_pos or not self._categories:
+            return {}
+        pos_type = "B" if self._is_batter else "P"
+        batting_pos = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF", "OF"}
+        pitching_pos = {"SP", "RP"}
+        target_pos = batting_pos if self._is_batter else pitching_pos
+
+        # Collect all replacement players for matching positions
+        repl_players: list[PlayerStats] = []
+        for pos, players in self._replacement_by_pos.items():
+            if pos in target_pos:
+                repl_players.extend(players[:5])  # top 5 per position
+
+        if not repl_players:
+            return {}
+
+        result: dict[str, float] = {}
+        for cat in self._categories:
+            if cat.is_only_display or cat.position_type != pos_type:
+                continue
+            attr = self._DISPLAY_TO_ATTR.get(cat.display_name)
+            if attr is None:
+                continue
+            values: list[float] = []
+            for p in repl_players:
+                try:
+                    values.append(float(p.stats.get(cat.stat_id, "0")))
+                except (ValueError, TypeError):
+                    continue
+            if values:
+                result[attr] = sum(values) / len(values)
+        return result
+
+    def compose(self) -> ComposeResult:
+        from textual_plotext import PlotextPlot
+        yield Header()
+        yield Static("", id="pd-header")
+        yield Static("", id="pd-info")
+        yield Static("", id="pd-controls")
+        with Vertical(id="pd-loading-container"):
+            yield LoadingIndicator(id="pd-spinner")
+            yield Static("Loading player data...", id="pd-loading-status")
+        with VerticalScroll(id="pd-scroll"):
+            yield Static(" Traditional Stats", classes="pd-section-label")
+            yield DataTable(id="pd-trad-table", classes="pd-table")
+            yield Static(" Statcast", classes="pd-section-label")
+            yield DataTable(id="pd-sc-table", classes="pd-table")
+            yield Static("", id="pd-chart-section-label", classes="pd-section-label")
+            with Horizontal(classes="pd-chart-row"):
+                for i in range(4):
+                    yield PlotextPlot(id=f"pd-chart-{i}", classes="pd-chart")
+            with Horizontal(classes="pd-chart-row"):
+                for i in range(4, 8):
+                    yield PlotextPlot(id=f"pd-chart-{i}", classes="pd-chart")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self.query_one("#pd-header", Static).update(
+            " Player Detail \u2014 3-Year View "
+        )
+        info = Text()
+        info.append(f"\n {self._player_name}", style="bold #E8A735")
+        info.append(f"  {self._player_position}", style="dim")
+        info.append(f"  {self._player_team}", style="bold")
+        info.append(
+            f"  ({'Batter' if self._is_batter else 'Pitcher'})\n", style="dim",
+        )
+        self.query_one("#pd-info", Static).update(info)
+        self._update_controls()
+        self.query_one("#pd-scroll").display = False
+        self.run_worker(self._load_data, group="pd-load", exclusive=True)
+
+    def _update_controls(self) -> None:
+        t = Text()
+        for key, label, mode in [
+            ("1", "Traditional Charts", "traditional"),
+            ("2", "Statcast Charts", "statcast"),
+        ]:
+            t.append("  ")
+            if self._chart_mode == mode:
+                t.append(f" {key} ", style="bold on #4A7C59")
+                t.append(f" {label} ", style="bold #E8A735")
+            else:
+                t.append(f" {key} ", style="dim")
+                t.append(f" {label} ", style="dim")
+        self.query_one("#pd-controls", Static).update(t)
+
+    async def _load_data(self) -> None:
+        """Progressive load: current year first, then backfill prior years."""
+        from datetime import date
+        from gkl.statcast import (
+            get_batter_statcast_multi_year, get_pitcher_statcast_multi_year,
+            get_statcast_league_averages, lookup_mlbam_id,
+        )
+        from gkl.mlb_api import get_player_batting_stats, get_player_pitching_stats
+
+        try:
+            self.query_one("#pd-loading-container").display = True
+            self.query_one("#pd-scroll").display = False
+        except Exception:
+            pass
+
+        current_year = date.today().year
+        self._years = [current_year - 2, current_year - 1, current_year]
+
+        try:
+            self.query_one("#pd-loading-status", Static).update(
+                "Looking up player..."
+            )
+        except Exception:
+            pass
+        self._mlbam_id = await asyncio.to_thread(lookup_mlbam_id, self._player_name)
+
+        if self._mlbam_id is None:
+            try:
+                self.query_one("#pd-loading-status", Static).update(
+                    f"Could not find MLBAM ID for {self._player_name}"
+                )
+                self.query_one("#pd-spinner").display = False
+            except Exception:
+                pass
+            return
+
+        # --- Phase 1: current year (fast — statcast likely already cached) ---
+        try:
+            self.query_one("#pd-loading-status", Static).update(
+                f"Loading {current_year} stats..."
+            )
+        except Exception:
+            pass
+
+        if self._is_batter:
+            self._batting_stats = await asyncio.to_thread(
+                get_player_batting_stats, self._mlbam_id, [current_year],
+            )
+            self._statcast_data = await asyncio.to_thread(
+                get_batter_statcast_multi_year, self._mlbam_id, [current_year],
+            )
+        else:
+            self._pitching_stats = await asyncio.to_thread(
+                get_player_pitching_stats, self._mlbam_id, [current_year],
+            )
+            self._statcast_data = await asyncio.to_thread(
+                get_pitcher_statcast_multi_year, self._mlbam_id, [current_year],
+            )
+
+        # Compute reference lines (fantasy league data is instant, MLB avg
+        # uses current-year statcast cache that's already loaded)
+        self._league_avg = self._compute_fantasy_league_avg()
+        self._repl_avg = self._compute_replacement_avg()
+        p_type = "batter" if self._is_batter else "pitcher"
+        self._mlb_avg = await asyncio.to_thread(
+            get_statcast_league_averages, [current_year], p_type,
+        )
+
+        # Show what we have so far
+        try:
+            self.query_one("#pd-loading-container").display = False
+            self.query_one("#pd-scroll").display = True
+        except Exception:
+            pass
+        self._render_tables()
+        self._render_charts()
+
+        # --- Phase 2: backfill prior years in background ---
+        prior_years = [current_year - 1, current_year - 2]
+        self.run_worker(
+            self._backfill_years(prior_years),
+            group="pd-backfill", exclusive=True,
+        )
+
+    async def _backfill_years(self, years: list[int]) -> None:
+        """Load prior-year data and re-render as each year arrives."""
+        from gkl.statcast import (
+            get_batter_statcast_multi_year, get_pitcher_statcast_multi_year,
+            get_statcast_league_averages,
+        )
+        from gkl.mlb_api import get_player_batting_stats, get_player_pitching_stats
+
+        if self._mlbam_id is None:
+            return
+
+        for year in years:
+            # Traditional stats (fast — single API call per year)
+            if self._is_batter:
+                result = await asyncio.to_thread(
+                    get_player_batting_stats, self._mlbam_id, [year],
+                )
+                self._batting_stats.update(result)
+            else:
+                result = await asyncio.to_thread(
+                    get_player_pitching_stats, self._mlbam_id, [year],
+                )
+                self._pitching_stats.update(result)
+
+            # Statcast (slower — may download full leaderboard)
+            if self._is_batter:
+                sc = await asyncio.to_thread(
+                    get_batter_statcast_multi_year, self._mlbam_id, [year],
+                )
+            else:
+                sc = await asyncio.to_thread(
+                    get_pitcher_statcast_multi_year, self._mlbam_id, [year],
+                )
+            self._statcast_data.update(sc)
+
+            # Re-render with new data
+            self._render_tables()
+            self._render_charts()
+
+        # Update MLB avg now that all years are loaded
+        p_type = "batter" if self._is_batter else "pitcher"
+        self._mlb_avg = await asyncio.to_thread(
+            get_statcast_league_averages, self._years, p_type,
+        )
+        self._render_charts()
+
+    # ---- tables (always visible) ----
+
+    def _render_tables(self) -> None:
+        self._render_traditional()
+        self._render_statcast()
+
+    def _render_traditional(self) -> None:
+        table = self.query_one("#pd-trad-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        if self._is_batter:
+            cols = ["Season", "G", "PA", "AB", "H", "HR", "RBI", "R",
+                    "SB", "BB", "SO", "AVG", "OBP", "SLG", "OPS"]
+            table.add_columns(*cols)
+            for year in self._years:
+                s = self._batting_stats.get(year)
+                if s is None:
+                    row = [Text(str(year), style="bold")] + [
+                        Text("\u2014", style="dim") for _ in range(len(cols) - 1)
+                    ]
+                else:
+                    row = [
+                        Text(str(year), style="bold"),
+                        Text(str(s.games)), Text(str(s.pa)), Text(str(s.ab)),
+                        Text(str(s.hits)), Text(str(s.hr), style="bold #E8A735"),
+                        Text(str(s.rbi)), Text(str(s.runs)),
+                        Text(str(s.sb)), Text(str(s.bb)), Text(str(s.so)),
+                        Text(f"{s.avg:.3f}"), Text(f"{s.obp:.3f}"),
+                        Text(f"{s.slg:.3f}"), Text(f"{s.ops:.3f}", style="bold"),
+                    ]
+                table.add_row(*row)
+        else:
+            cols = ["Season", "G", "GS", "W", "L", "SV", "IP", "H",
+                    "ER", "BB", "SO", "ERA", "WHIP", "K/9", "BB/9"]
+            table.add_columns(*cols)
+            for year in self._years:
+                s = self._pitching_stats.get(year)
+                if s is None:
+                    row = [Text(str(year), style="bold")] + [
+                        Text("\u2014", style="dim") for _ in range(len(cols) - 1)
+                    ]
+                else:
+                    row = [
+                        Text(str(year), style="bold"),
+                        Text(str(s.games)), Text(str(s.games_started)),
+                        Text(str(s.wins), style="bold #6AAF6E"),
+                        Text(str(s.losses)), Text(str(s.saves)),
+                        Text(f"{s.ip:.1f}"), Text(str(s.hits)),
+                        Text(str(s.er)), Text(str(s.bb)),
+                        Text(str(s.so), style="bold #E8A735"),
+                        Text(f"{s.era:.2f}"), Text(f"{s.whip:.2f}"),
+                        Text(f"{s.k_per_9:.1f}"), Text(f"{s.bb_per_9:.1f}"),
+                    ]
+                table.add_row(*row)
+
+    def _render_statcast(self) -> None:
+        table = self.query_one("#pd-sc-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+
+        def _fmt(val: float | None, decimals: int = 1, pct: bool = False) -> Text:
+            if val is None:
+                return Text("\u2014", style="dim")
+            suffix = "%" if pct else ""
+            return Text(f"{val:.{decimals}f}{suffix}")
+
+        if self._is_batter:
+            cols = ["Season", "PA", "EV", "MaxEV", "LA", "Barrel%",
+                    "HardHit%", "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA"]
+            table.add_columns(*cols)
+            for year in self._years:
+                sc = self._statcast_data.get(year)
+                if sc is None:
+                    row = [Text(str(year), style="bold")] + [
+                        Text("\u2014", style="dim") for _ in range(len(cols) - 1)
+                    ]
+                else:
+                    row = [
+                        Text(str(year), style="bold"),
+                        Text(str(sc.pa)),
+                        _fmt(sc.avg_exit_velo), _fmt(sc.max_exit_velo),
+                        _fmt(sc.avg_launch_angle),
+                        _fmt(sc.barrel_pct, pct=True),
+                        _fmt(sc.hard_hit_pct, pct=True),
+                        _fmt(sc.k_pct, pct=True), _fmt(sc.bb_pct, pct=True),
+                        _fmt(sc.whiff_pct, pct=True),
+                        _fmt(sc.xba, 3), _fmt(sc.xslg, 3),
+                        _fmt(sc.xwoba, 3),
+                    ]
+                table.add_row(*row)
+        else:
+            cols = ["Season", "PA", "EV", "Barrel%", "HardHit%",
+                    "xBA", "xSLG", "xwOBA", "xERA",
+                    "K%", "BB%", "Whiff%", "CSW%", "Velo"]
+            table.add_columns(*cols)
+            for year in self._years:
+                sc = self._statcast_data.get(year)
+                if sc is None:
+                    row = [Text(str(year), style="bold")] + [
+                        Text("\u2014", style="dim") for _ in range(len(cols) - 1)
+                    ]
+                else:
+                    row = [
+                        Text(str(year), style="bold"),
+                        Text(str(sc.pa)),
+                        _fmt(sc.avg_exit_velo),
+                        _fmt(sc.barrel_pct, pct=True),
+                        _fmt(sc.hard_hit_pct, pct=True),
+                        _fmt(sc.xba, 3), _fmt(sc.xslg, 3),
+                        _fmt(sc.xwoba, 3), _fmt(sc.xera, 2),
+                        _fmt(sc.k_pct, pct=True), _fmt(sc.bb_pct, pct=True),
+                        _fmt(sc.whiff_pct, pct=True),
+                        _fmt(sc.csw_pct, pct=True),
+                        _fmt(sc.avg_velo),
+                    ]
+                table.add_row(*row)
+
+    # ---- charts ----
+
+    # Per-chart color palettes — each chart gets a distinct hue so
+    # adjacent charts are easy to tell apart at a glance.
+    _CHART_PALETTES = [
+        ["#E8A735", "#F0C060", "#D49020"],  # amber
+        ["#5BA4CF", "#7BBCE0", "#3B8CBF"],  # sky blue
+        ["#6AAF6E", "#8CCF8E", "#4A8F4E"],  # green
+        ["#C75D5D", "#E07070", "#A04040"],   # red
+        ["#B48CC8", "#CCA8E0", "#9470B0"],   # purple
+        ["#D4A84B", "#E8C870", "#C09030"],   # gold
+        ["#5BC0BE", "#80D8D6", "#3AA09E"],   # teal
+        ["#E07B60", "#F09880", "#C06040"],   # coral
+    ]
+
+    def _get_chart_specs(self) -> list[tuple[str, str]]:
+        """Return (title, attr_or_key) tuples for the current chart mode.
+
+        Each spec produces one small bar chart with 3 bars (one per year).
+        Traditional specs pull from _batting_stats / _pitching_stats.
+        Statcast specs pull from _statcast_data.
+        """
+        if self._chart_mode == "traditional":
+            if self._is_batter:
+                return [
+                    ("HR", "hr"), ("RBI", "rbi"),
+                    ("R", "runs"), ("SB", "sb"),
+                    ("AVG", "avg"), ("OBP", "obp"),
+                    ("SLG", "slg"), ("OPS", "ops"),
+                ]
+            else:
+                return [
+                    ("W", "wins"), ("SV", "saves"),
+                    ("SO", "so"), ("IP", "ip"),
+                    ("ERA", "era"), ("WHIP", "whip"),
+                    ("K/9", "k_per_9"), ("BB/9", "bb_per_9"),
+                ]
+        else:  # statcast
+            if self._is_batter:
+                return [
+                    ("EV", "avg_exit_velo"), ("Barrel%", "barrel_pct"),
+                    ("HardHit%", "hard_hit_pct"), ("K%", "k_pct"),
+                    ("BB%", "bb_pct"), ("Whiff%", "whiff_pct"),
+                    ("xBA", "xba"), ("xwOBA", "xwoba"),
+                ]
+            else:
+                return [
+                    ("EV", "avg_exit_velo"), ("Barrel%", "barrel_pct"),
+                    ("K%", "k_pct"), ("Whiff%", "whiff_pct"),
+                    ("xERA", "xera"), ("xwOBA", "xwoba"),
+                    ("CSW%", "csw_pct"), ("Velo", "avg_velo"),
+                ]
+
+    def _get_stat_value(self, year: int, attr: str) -> float:
+        """Pull a single stat value for a year from the right data source."""
+        if self._chart_mode == "traditional":
+            src = self._batting_stats if self._is_batter else self._pitching_stats
+            entry = src.get(year)
+        else:
+            entry = self._statcast_data.get(year)
+        if entry is None:
+            return 0.0
+        val = getattr(entry, attr, None)
+        return float(val) if val is not None else 0.0
+
+    def _render_charts(self) -> None:
+        from textual_plotext import PlotextPlot
+
+        specs = self._get_chart_specs()
+        year_labels = [str(y) for y in self._years]
+
+        if self._chart_mode == "traditional":
+            legend = " Traditional \u2014 Year over Year  (\u2500 League Avg  \u2500 Repl Level)"
+        else:
+            legend = " Statcast \u2014 Year over Year  (\u2500 MLB Avg)"
+        self.query_one("#pd-chart-section-label", Static).update(legend)
+
+        for i in range(self._CHART_COUNT):
+            pw = self.query_one(f"#pd-chart-{i}", PlotextPlot)
+            plt = pw.plt
+            plt.clear_data()
+            plt.clear_figure()
+
+            if i < len(specs):
+                title, attr = specs[i]
+                palette = self._CHART_PALETTES[i % len(self._CHART_PALETTES)]
+                values = [self._get_stat_value(y, attr) for y in self._years]
+                plt.bar(
+                    year_labels,
+                    values,
+                    color=palette,
+                    width=0.6,
+                )
+
+                # Collect reference line values so we can set ylim properly
+                ref_lines: list[tuple[float, tuple[int, int, int]]] = []
+                if self._chart_mode == "traditional":
+                    lg = self._league_avg.get(attr)
+                    if lg and lg > 0:
+                        ref_lines.append((lg, (232, 167, 53)))   # gold
+                    rp = self._repl_avg.get(attr)
+                    if rp and rp > 0:
+                        ref_lines.append((rp, (160, 80, 80)))    # dim red
+                else:
+                    mlb = self._mlb_avg.get(attr)
+                    if mlb and mlb > 0:
+                        ref_lines.append((mlb, (180, 180, 180))) # gray
+
+                if ref_lines:
+                    max_ref = max(v for v, _ in ref_lines)
+                    ceiling = max(max(values, default=0), max_ref) * 1.15
+                    plt.ylim(0, ceiling)
+                    for val, color in ref_lines:
+                        plt.hline(val, color=color)
+
+                plt.title(title)
+                plt.theme("dark")
+                pw.display = True
+            else:
+                pw.display = False
+            pw.refresh()
+
+    def action_go_back(self) -> None:
+        self.app.pop_screen()
+
+    def action_charts_traditional(self) -> None:
+        if not self._years:
+            return
+        self._chart_mode = "traditional"
+        self._update_controls()
+        self._render_charts()
+
+    def action_charts_statcast(self) -> None:
+        if not self._years:
+            return
+        self._chart_mode = "statcast"
+        self._update_controls()
+        self._render_charts()
+
+
 # --- Transactions Screen ---
 
 
@@ -4190,7 +4881,8 @@ class ScoreboardScreen(Screen):
                 ("left", "prev_week", "Prev Week"),
                 ("right", "next_week", "Next Week"),
                 ("e", "select_week", "Select Week"),
-                ("L", "switch_league", "Switch League")]
+                ("L", "switch_league", "Switch League"),
+                ("i", "player_detail", "Player Detail")]
     CSS = """
     #board-header {
         height: 1;
@@ -4670,6 +5362,7 @@ class ScoreboardScreen(Screen):
     ) -> None:
         table.cursor_type = "row"
         table.zebra_stripes = True
+        table._players = players  # type: ignore[attr-defined]
 
         cols = ["Player", "Pos"]
         for cat in cats:
@@ -4723,6 +5416,27 @@ class ScoreboardScreen(Screen):
     def action_refresh(self) -> None:
         if self.league:
             self.run_worker(self._refresh_data)
+
+    def action_player_detail(self) -> None:
+        try:
+            focused = self.query("DataTable:focus")
+            if not focused:
+                return
+            table = focused.first()
+        except Exception:
+            return
+        players = getattr(table, "_players", [])
+        row_idx = table.cursor_row
+        if row_idx < 0 or row_idx >= len(players):
+            return
+        p = players[row_idx]
+        cache = self.app.shared_cache
+        self.app.push_screen(PlayerDetailScreen(
+            p.name, p.position, p.team_abbr,
+            categories=self.categories,
+            all_teams=cache.all_teams if cache.is_loaded else None,
+            replacement_by_pos=cache.replacement_by_pos if cache.is_loaded else None,
+        ))
 
     def action_standings(self) -> None:
         if self.league:
