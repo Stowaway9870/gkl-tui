@@ -106,7 +106,7 @@ class YahooFantasyAPI:
                 )
                 resp.raise_for_status()
                 return resp.json()["fantasy_content"]
-            except (httpx.ConnectTimeout, httpx.ReadTimeout):
+            except (httpx.ConnectTimeout, httpx.ReadTimeout, httpx.ConnectError):
                 if attempt == retries:
                     raise
                 import time

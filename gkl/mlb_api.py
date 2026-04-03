@@ -104,6 +104,85 @@ def _safe_float(val: str | float | int | None, default: float = 0.0) -> float:
         return default
 
 
+_birth_date_cache: dict[int, date | None] = {}
+_games_played_cache: dict[int, tuple[int, int]] = {}  # mlbam_id -> (season, G)
+
+
+def get_player_games(mlbam_ids: list[int]) -> dict[int, int]:
+    """Fetch current-season games played for multiple players.
+
+    Returns {mlbam_id: games_played}.  Results are cached per season.
+    """
+    current_year = date.today().year
+    needed = [
+        pid for pid in mlbam_ids
+        if pid not in _games_played_cache
+        or _games_played_cache[pid][0] != current_year
+    ]
+
+    # MLB's /people endpoint doesn't support stat hydration in bulk,
+    # so fetch per-player (cached IDs are skipped).
+    for pid in needed:
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/people/{pid}/stats",
+                params={"stats": "season", "season": current_year, "group": "hitting,pitching"},
+                timeout=10,
+            )
+            resp.raise_for_status()
+            gp = 0
+            for stat_group in resp.json().get("stats", []):
+                for split in stat_group.get("splits", []):
+                    gp = max(gp, split.get("stat", {}).get("gamesPlayed", 0))
+            _games_played_cache[pid] = (current_year, gp)
+        except (httpx.HTTPError, Exception):
+            _games_played_cache[pid] = (current_year, 0)
+
+    return {
+        pid: _games_played_cache[pid][1]
+        for pid in mlbam_ids
+        if pid in _games_played_cache
+    }
+
+
+def get_player_ages(mlbam_ids: list[int]) -> dict[int, int]:
+    """Bulk fetch ages for multiple players via the MLB people endpoint.
+
+    Returns {mlbam_id: age}.  Results are cached across calls.
+    """
+    today = date.today()
+    needed = [pid for pid in mlbam_ids if pid not in _birth_date_cache]
+    if needed:
+        # MLB API accepts comma-separated personIds
+        ids_str = ",".join(str(pid) for pid in needed)
+        try:
+            resp = httpx.get(
+                f"{MLB_API_BASE}/people",
+                params={"personIds": ids_str},
+                timeout=15,
+            )
+            resp.raise_for_status()
+            for person in resp.json().get("people", []):
+                pid = person.get("id")
+                birth = person.get("birthDate")
+                if pid is not None:
+                    _birth_date_cache[pid] = (
+                        date.fromisoformat(birth) if birth else None
+                    )
+        except (httpx.HTTPError, Exception):
+            pass
+
+    result: dict[int, int] = {}
+    for pid in mlbam_ids:
+        bd = _birth_date_cache.get(pid)
+        if bd:
+            result[pid] = (
+                today.year - bd.year
+                - ((today.month, today.day) < (bd.month, bd.day))
+            )
+    return result
+
+
 def get_player_batting_stats(
     mlbam_id: int, years: list[int],
 ) -> dict[int, MLBBattingStats | None]:

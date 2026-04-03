@@ -8,6 +8,7 @@ import sys
 
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import Screen
 from textual.theme import Theme
@@ -33,9 +34,10 @@ from gkl.yahoo_auth import YahooAuth, load_credentials, save_credentials
 from gkl.stats import (
     who_wins, simulate_h2h, compute_power_rankings, aggregate_h2h_season,
     H2HResult, TeamH2HSummary, SGPCalculator,
+    build_stat_columns, get_stat_value,
 )
 from gkl.datastore import RosterDataStore
-from gkl.mlb_api import MLBGame, get_mlb_scoreboard
+from gkl.mlb_api import MLBGame, get_mlb_scoreboard, get_player_ages, get_player_games
 from gkl.statcast import (
     get_batter_statcast, get_pitcher_statcast, lookup_mlbam_id,
     StatcastBatter, StatcastPitcher,
@@ -120,37 +122,125 @@ def _compute_roto(
     return results
 
 
-# --- Roto Standings Screen ---
+# --- Week Range Modal ---
 
 
-CHART_COLORS = [
-    (232, 167, 53), (91, 164, 207), (106, 175, 110), (199, 93, 93),
-    (180, 140, 200), (220, 180, 100), (100, 200, 200), (200, 130, 80),
-    (150, 180, 100), (180, 100, 150), (100, 150, 200), (200, 200, 100),
-    (130, 130, 200), (200, 150, 150), (100, 200, 150), (200, 100, 200),
-    (150, 200, 200), (200, 180, 150),
-]
+class WeekRangeModal(Screen):
+    """Modal for selecting a start and end week range."""
+    BINDINGS = [("escape", "cancel", "Cancel")]
+    CSS = """
+    WeekRangeModal {
+        align: center middle;
+    }
+    #wr-container {
+        width: 40;
+        height: auto;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #wr-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+        margin-bottom: 1;
+    }
+    .wr-label {
+        height: 1;
+        margin-top: 1;
+    }
+    #wr-start, #wr-end {
+        width: 100%;
+    }
+    #wr-submit {
+        margin-top: 1;
+        width: 100%;
+        content-align: center middle;
+    }
+    """
+
+    def __init__(self, max_week: int, current_start: int, current_end: int) -> None:
+        super().__init__()
+        self.max_week = max_week
+        self.current_start = current_start
+        self.current_end = current_end
+
+    def compose(self) -> ComposeResult:
+        from textual.widgets import Button
+        with Vertical(id="wr-container"):
+            yield Static("Set Week Range", id="wr-title")
+            yield Static(f"Start week (1-{self.max_week}):", classes="wr-label")
+            yield Input(str(self.current_start), id="wr-start", type="integer")
+            yield Static(f"End week (1-{self.max_week}):", classes="wr-label")
+            yield Input(str(self.current_end), id="wr-end", type="integer")
+            yield Button("Apply", id="wr-submit", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#wr-start", Input).focus()
+
+    def on_button_pressed(self, event) -> None:
+        self._submit()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "wr-start":
+            self.query_one("#wr-end", Input).focus()
+        else:
+            self._submit()
+
+    def _submit(self) -> None:
+        try:
+            start = int(self.query_one("#wr-start", Input).value)
+            end = int(self.query_one("#wr-end", Input).value)
+        except ValueError:
+            return
+        start = max(1, min(start, self.max_week))
+        end = max(1, min(end, self.max_week))
+        if start > end:
+            start, end = end, start
+        self.dismiss((start, end))
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
 
 
-class RotoStandingsScreen(Screen):
+# --- League Standings Screen ---
+
+
+class LeagueStandingsScreen(Screen):
+    """Combined league standings: H2H record on top, full roto table on bottom."""
     BINDINGS = [("escape", "go_back", "Back"), ("q", "go_back", "Back"),
                 ("1", "show_overall", "Overall"), ("2", "show_batting", "Batting"),
                 ("3", "show_pitching", "Pitching"),
-                ("w", "pick_weeks", "Weeks"),
-                ("a", "select_all", "All Weeks")]
+                ("w", "set_weeks", "Set Weeks")]
     CSS = """
-    #roto-header {
+    #ls-header {
         height: 1;
         content-align: center middle;
         text-style: bold;
         background: $primary;
         color: $foreground;
     }
-    #roto-controls {
+    #ls-top {
+        height: auto;
+        max-height: 50%;
+    }
+    #ls-top-label {
         height: 1;
         content-align: center middle;
-        background: $surface;
-        color: $text-muted;
+        background: #3A4A3A;
+        color: $foreground;
+        text-style: bold;
+    }
+    #ls-table {
+        height: auto;
+        max-height: 100%;
+        background: $panel;
+    }
+    #ls-bottom {
+        height: 1fr;
+        border-top: solid $primary;
     }
     #roto-view-label {
         height: 1;
@@ -167,14 +257,10 @@ class RotoStandingsScreen(Screen):
         background: #3A5A3A;
         color: #E8E4DF;
     }
-    #roto-loading {
+    #ls-loading {
         height: 3;
         content-align: center middle;
         color: $text-muted;
-    }
-    #roto-chart {
-        height: 40%;
-        border-top: solid $primary;
     }
     """
 
@@ -184,122 +270,219 @@ class RotoStandingsScreen(Screen):
         self.api = api
         self.league = league
         self.categories = categories
-        self.teams: list[TeamStats] = []
+        self._roto_teams: list[TeamStats] = []
         self._current_view = "overall"
         self._week_start = 1
         self._week_end = max(1, league.current_week)
         self._max_week = max(1, league.current_week)
-        # Per-week roto ranks for chart: {team_name: [rank_wk1, rank_wk2, ...]}
-        self._weekly_ranks: dict[str, list[float]] = {}
 
     def compose(self) -> ComposeResult:
-        from textual_plotext import PlotextPlot
         yield Header()
-        yield Static("", id="roto-header")
-        yield Static("", id="roto-controls")
-        yield Static("", id="roto-view-label")
-        yield Static("Loading standings...", id="roto-loading")
-        yield DataTable(id="roto-table")
-        yield PlotextPlot(id="roto-chart")
+        yield Static("", id="ls-header")
+        with Vertical(id="ls-top"):
+            yield Static("", id="ls-top-label")
+            yield DataTable(id="ls-table")
+        with Vertical(id="ls-bottom"):
+            yield Static("", id="roto-view-label")
+            yield DataTable(id="roto-table")
+        yield Static("Loading standings...", id="ls-loading")
         yield Footer()
 
     def on_mount(self) -> None:
-        self.query_one("#roto-header", Static).update(
-            f" {self.league.name} — Roto Standings "
+        self.query_one("#ls-header", Static).update(
+            f" {self.league.name} — League Standings "
         )
-        self.query_one("#roto-table", DataTable).display = False
-        self.query_one("#roto-chart").display = False
-        self._update_controls()
+        self.query_one("#ls-top").display = False
+        self.query_one("#ls-bottom").display = False
         self.run_worker(self._load)
 
-    def _update_controls(self) -> None:
-        ctrl = Text()
-        ctrl.append("[1] Overall  [2] Batting  [3] Pitching", style="dim")
-        ctrl.append("  |  ")
-        ctrl.append(f"Weeks {self._week_start}-{self._week_end}", style="bold")
-        ctrl.append(f"  ([w] change, [a] all)", style="dim")
-        self.query_one("#roto-controls", Static).update(ctrl)
-
     async def _load(self) -> None:
-        await self._fetch_and_render()
+        cache = self.app.shared_cache
 
-    async def _fetch_and_render(self) -> None:
+        # Fetch all weeks' matchups and team stats in parallel
+        all_weeks = list(range(1, self.league.current_week + 1))
+        await cache.prefetch_weeks(self.api, self.league.league_key, all_weeks)
+
+        # Prefetch matchups
+        missing_matchups = [w for w in all_weeks if w not in cache.week_matchups]
+        if missing_matchups:
+            matchup_results = await asyncio.gather(*[
+                asyncio.to_thread(self.api.get_scoreboard,
+                                  self.league.league_key, w)
+                for w in missing_matchups
+            ])
+            for w, data in zip(missing_matchups, matchup_results):
+                cache.week_matchups[w] = data
+
+        # Compute actual H2H records from matchup results
+        num_scored_cats = len([c for c in self.categories if not c.is_only_display])
+        h2h_records: dict[str, dict] = {}
+        for w in all_weeks:
+            matchups = cache.week_matchups.get(w, [])
+            for m in matchups:
+                if m.status == "preevent":
+                    continue
+                pa, pb = m.team_a.points, m.team_b.points
+                for team_key in (m.team_a.team_key, m.team_b.team_key):
+                    if team_key not in h2h_records:
+                        h2h_records[team_key] = {
+                            "wins": 0, "losses": 0, "ties": 0,
+                            "cat_wins": 0, "cat_losses": 0, "cat_ties": 0,
+                        }
+                cat_ties = int(num_scored_cats - pa - pb)
+                # Weekly matchup winner
+                if pa > pb:
+                    h2h_records[m.team_a.team_key]["wins"] += 1
+                    h2h_records[m.team_b.team_key]["losses"] += 1
+                elif pb > pa:
+                    h2h_records[m.team_a.team_key]["losses"] += 1
+                    h2h_records[m.team_b.team_key]["wins"] += 1
+                else:
+                    h2h_records[m.team_a.team_key]["ties"] += 1
+                    h2h_records[m.team_b.team_key]["ties"] += 1
+                # Category-level totals
+                h2h_records[m.team_a.team_key]["cat_wins"] += int(pa)
+                h2h_records[m.team_a.team_key]["cat_losses"] += int(pb)
+                h2h_records[m.team_a.team_key]["cat_ties"] += cat_ties
+                h2h_records[m.team_b.team_key]["cat_wins"] += int(pb)
+                h2h_records[m.team_b.team_key]["cat_losses"] += int(pa)
+                h2h_records[m.team_b.team_key]["cat_ties"] += cat_ties
+
+        # Compute roto rank summaries for the H2H table
+        season_teams = await asyncio.to_thread(
+            self.api.get_team_season_stats, self.league.league_key)
+
+        scored = [c for c in self.categories if not c.is_only_display]
+        bat_scored = [c for c in scored if c.position_type == "B"]
+        pitch_scored = [c for c in scored if c.position_type == "P"]
+
+        overall_roto = _compute_roto(season_teams, scored)
+        batting_roto = _compute_roto(season_teams, bat_scored)
+        pitching_roto = _compute_roto(season_teams, pitch_scored)
+
+        overall_rank = {e["team_key"]: r for r, e in enumerate(overall_roto, 1)}
+        batting_rank = {e["team_key"]: r for r, e in enumerate(batting_roto, 1)}
+        pitching_rank = {e["team_key"]: r for r, e in enumerate(pitching_roto, 1)}
+
+        # Build combined data sorted by H2H standings
+        team_info = {t.team_key: t for t in season_teams}
+        standings = []
+        for team_key, rec in h2h_records.items():
+            total = rec["wins"] + rec["losses"] + rec["ties"]
+            pct = rec["wins"] / total if total > 0 else 0.0
+            team = team_info.get(team_key)
+            standings.append({
+                "team_key": team_key,
+                "name": team.name if team else team_key,
+                "manager": team.manager if team else "",
+                "wins": rec["wins"],
+                "losses": rec["losses"],
+                "ties": rec["ties"],
+                "win_pct": pct,
+                "cat_wins": rec["cat_wins"],
+                "cat_losses": rec["cat_losses"],
+                "cat_ties": rec["cat_ties"],
+                "overall_rank": overall_rank.get(team_key, 0),
+                "batting_rank": batting_rank.get(team_key, 0),
+                "pitching_rank": pitching_rank.get(team_key, 0),
+            })
+        standings.sort(key=lambda s: (s["win_pct"], s["wins"]), reverse=True)
+
+        # Remove loading indicator, show both panels
+        loading = self.query("#ls-loading")
+        if loading:
+            loading.first().remove()
+        self.query_one("#ls-top").display = True
+        self.query_one("#ls-bottom").display = True
+
+        # Render H2H standings table
+        self.query_one("#ls-top-label", Static).update(" H2H Standings ")
+        table = self.query_one("#ls-table", DataTable)
+        table.clear(columns=True)
+        table.cursor_type = "row"
+        table.zebra_stripes = True
+        table.add_columns("#", "Team", "Manager", "H2H Record", "Win %",
+                          "Total Record", "Total Win %", "Roto Overall",
+                          "Roto Batting", "Roto Pitching")
+
+        num_teams = len(standings)
+        for rank, s in enumerate(standings, 1):
+            pct = s["win_pct"]
+            pct_style = "bold green" if pct >= 0.6 else "bold red" if pct < 0.4 else ""
+
+            cat_total = s["cat_wins"] + s["cat_losses"] + s["cat_ties"]
+            cat_pct = s["cat_wins"] / cat_total if cat_total > 0 else 0.0
+            cat_pct_style = "bold green" if cat_pct >= 0.6 else "bold red" if cat_pct < 0.4 else ""
+
+            def _roto_style(r: int, n: int = num_teams) -> str:
+                if r <= 3:
+                    return "bold green"
+                elif r >= n - 2:
+                    return "bold red"
+                return ""
+
+            table.add_row(
+                Text(str(rank), justify="right"),
+                Text(s["name"], style="bold"),
+                Text(s["manager"], style="dim"),
+                Text(f"{s['wins']}-{s['losses']}-{s['ties']}", justify="center"),
+                Text(f"{pct:.1%}", style=pct_style, justify="right"),
+                Text(f"{s['cat_wins']}-{s['cat_losses']}-{s['cat_ties']}",
+                     justify="center"),
+                Text(f"{cat_pct:.1%}", style=cat_pct_style, justify="right"),
+                Text(str(s["overall_rank"]), style=_roto_style(s["overall_rank"]),
+                     justify="center"),
+                Text(str(s["batting_rank"]), style=_roto_style(s["batting_rank"]),
+                     justify="center"),
+                Text(str(s["pitching_rank"]), style=_roto_style(s["pitching_rank"]),
+                     justify="center"),
+            )
+
+        # Initial roto table load (full season)
+        self._roto_teams = season_teams
+        self._render_roto_table()
+
+    async def _fetch_roto(self) -> None:
+        """Fetch roto stats for the selected week range and re-render."""
         from gkl.stats import aggregate_weekly_stats
 
         cache = self.app.shared_cache
-        scored = [c for c in self.categories if not c.is_only_display]
-
-        # Prefetch all needed weeks in parallel via shared cache
         needed = list(range(self._week_start, self._week_end + 1))
         await cache.prefetch_weeks(self.api, self.league.league_key, needed)
 
-        weekly_data = [cache.week_team_stats[w] for w in needed]
-
-        # Aggregate for the selected range
         if self._week_start == 1 and self._week_end == self._max_week:
-            # Full season — use the faster season endpoint
-            self.teams = await asyncio.to_thread(
+            self._roto_teams = await asyncio.to_thread(
                 self.api.get_team_season_stats, self.league.league_key)
         else:
-            self.teams = aggregate_weekly_stats(weekly_data, self.categories)
+            weekly_data = [cache.week_team_stats[w] for w in needed]
+            self._roto_teams = aggregate_weekly_stats(weekly_data, self.categories)
 
-        # Compute per-week cumulative roto ranks for chart
-        await self._compute_weekly_ranks(scored)
+        self._render_roto_table()
 
-        loading = self.query("#roto-loading")
-        if loading:
-            loading.first().remove()
-        self.query_one("#roto-table", DataTable).display = True
-        self.query_one("#roto-chart").display = True
-        self._render_table()
-        self._render_chart()
-
-    async def _compute_weekly_ranks(self, cats: list[StatCategory]) -> None:
-        """Compute cumulative roto rank at each week for the chart."""
-        from gkl.stats import aggregate_weekly_stats
-
-        cache = self.app.shared_cache
-        self._weekly_ranks = {}
-        weeks = list(range(1, self._max_week + 1))
-
-        # Prefetch all weeks via shared cache
-        await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
-
-        for end_week in weeks:
-            week_data = [cache.week_team_stats[w] for w in range(1, end_week + 1)]
-            cum_teams = aggregate_weekly_stats(week_data, self.categories)
-            standings = _compute_roto(cum_teams, cats)
-
-            for rank, entry in enumerate(standings, 1):
-                name = entry["name"]
-                if name not in self._weekly_ranks:
-                    self._weekly_ranks[name] = []
-                self._weekly_ranks[name].append(rank)
-
-    def _render_table(self) -> None:
+    def _render_roto_table(self) -> None:
         scored = [c for c in self.categories if not c.is_only_display]
-        batting_cats = [c for c in scored if c.position_type == "B"]
-        pitching_cats = [c for c in scored if c.position_type == "P"]
+        bat_scored = [c for c in scored if c.position_type == "B"]
+        pitch_scored = [c for c in scored if c.position_type == "P"]
 
         if self._current_view == "batting":
-            cats = batting_cats
+            cats = bat_scored
             label = f" BATTING ROTO — Weeks {self._week_start}-{self._week_end} "
         elif self._current_view == "pitching":
-            cats = pitching_cats
+            cats = pitch_scored
             label = f" PITCHING ROTO — Weeks {self._week_start}-{self._week_end} "
         else:
-            cats = batting_cats + pitching_cats
+            cats = bat_scored + pitch_scored
             label = f" OVERALL ROTO — Weeks {self._week_start}-{self._week_end} "
 
         self.query_one("#roto-view-label", Static).update(label)
 
-        standings = _compute_roto(self.teams, cats)
+        standings = _compute_roto(self._roto_teams, cats)
         table = self.query_one("#roto-table", DataTable)
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
 
-        col_keys = ["Rank", "Team", "Manager"]
+        col_keys: list[str | Text] = ["Rank", "Team", "Manager"]
         for cat in cats:
             col_keys.append(cat.display_name)
         col_keys.append("Total")
@@ -320,67 +503,31 @@ class RotoStandingsScreen(Screen):
             row.append(Text(f"{entry['total']:.1f}", style="bold", justify="right"))
             table.add_row(*row)
 
-    def _render_chart(self) -> None:
-        from textual_plotext import PlotextPlot
-
-        plot_widget = self.query_one("#roto-chart", PlotextPlot)
-        plt = plot_widget.plt
-        plt.clear_data()
-        plt.clear_figure()
-
-        weeks = list(range(1, self._max_week + 1))
-        if not weeks or not self._weekly_ranks:
-            return
-
-        num_teams = len(self._weekly_ranks)
-        # Build stable name->color mapping
-        team_colors: dict[str, tuple] = {}
-        for i, team in enumerate(self._weekly_ranks):
-            team_colors[team] = CHART_COLORS[i % len(CHART_COLORS)]
-
-        for team, ranks in self._weekly_ranks.items():
-            color = team_colors[team]
-            inverted = [-r for r in ranks]
-            plt.plot(weeks, inverted, color=color, marker="braille",
-                     label=team)
-
-        plt.yticks([])
-
-        plt.title("Roto Rank by Week (cumulative)")
-        plt.xlabel("Week")
-        plt.xticks(weeks, [str(w) for w in weeks])
-        plt.theme("dark")
-
-        plot_widget.refresh()
-
     def action_show_overall(self) -> None:
         self._current_view = "overall"
-        self._render_table()
+        self._render_roto_table()
 
     def action_show_batting(self) -> None:
         self._current_view = "batting"
-        self._render_table()
+        self._render_roto_table()
 
     def action_show_pitching(self) -> None:
         self._current_view = "pitching"
-        self._render_table()
+        self._render_roto_table()
 
-    def action_pick_weeks(self) -> None:
-        def _on_result(result: tuple[int, int] | None) -> None:
-            if result is not None:
-                self._week_start, self._week_end = result
-                self._update_controls()
-                self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
-        self.app.push_screen(
-            WeekRangeModal(self._max_week, self._week_start, self._week_end),
-            callback=_on_result,
+    def action_set_weeks(self) -> None:
+        modal = WeekRangeModal(
+            max_week=self._max_week,
+            current_start=self._week_start,
+            current_end=self._week_end,
         )
+        self.app.push_screen(modal, self._on_week_range_selected)
 
-    def action_select_all(self) -> None:
-        self._week_start = 1
-        self._week_end = self._max_week
-        self._update_controls()
-        self.run_worker(self._fetch_and_render, group="roto-fetch", exclusive=True)
+    def _on_week_range_selected(self, result: tuple[int, int] | None) -> None:
+        if result is None:
+            return
+        self._week_start, self._week_end = result
+        self.run_worker(self._fetch_roto, group="roto-fetch", exclusive=True)
 
     def action_go_back(self) -> None:
         self.app.pop_screen()
@@ -1382,9 +1529,8 @@ class RosterAnalysisScreen(Screen):
         else:
             players = self.api.get_roster_stats_season(team_key, week)
 
-        scored = [c for c in self.categories if not c.is_only_display]
-        batting_cats = [c for c in scored if c.position_type == "B"]
-        pitching_cats = [c for c in scored if c.position_type == "P"]
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
 
         batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
                              "OF", "Util", "DH", "IF", "BN"}
@@ -1396,9 +1542,11 @@ class RosterAnalysisScreen(Screen):
 
         # Pre-fetch statcast data so we can merge it into the main tables
         batter_statcast: dict[str, StatcastBatter] = {}
+        mlbam_ids: dict[str, int] = {}  # player name -> mlbam_id
         for p in batters:
             mlbam_id = lookup_mlbam_id(p.name)
             if mlbam_id is not None:
+                mlbam_ids[p.name] = mlbam_id
                 sc = get_batter_statcast(mlbam_id)
                 if sc is not None:
                     batter_statcast[p.name] = sc
@@ -1407,9 +1555,25 @@ class RosterAnalysisScreen(Screen):
         for p in pitchers:
             mlbam_id = lookup_mlbam_id(p.name)
             if mlbam_id is not None:
+                mlbam_ids[p.name] = mlbam_id
                 sc = get_pitcher_statcast(mlbam_id)
                 if sc is not None:
                     pitcher_statcast[p.name] = sc
+
+        # Bulk fetch player ages and games played from MLB API
+        all_ids = list(mlbam_ids.values())
+        age_by_id = get_player_ages(all_ids)
+        games_by_id = get_player_games(all_ids)
+        player_ages: dict[str, int] = {
+            name: age_by_id[mid]
+            for name, mid in mlbam_ids.items()
+            if mid in age_by_id
+        }
+        # Inject G into player stats dicts so pinned column rendering finds it
+        for p in batters + pitchers:
+            mid = mlbam_ids.get(p.name)
+            if mid and mid in games_by_id and "0" not in p.stats:
+                p.stats["0"] = str(games_by_id[mid])
 
         await self._show_loading(f"Rendering roster tables...")
 
@@ -1424,9 +1588,12 @@ class RosterAnalysisScreen(Screen):
         bat_table.clear(columns=True)
         bat_table.cursor_type = "row"
         bat_table.zebra_stripes = True
-        bat_cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Paid", "Avg$", "SGP", "Y!", "Pre"]
+        bat_cols: list[str | Text] = ["Player", "Pos".ljust(15), "Team", "Age", "Paid", "Avg$", "SGP", "Y!", "Pre"]
         for cat in batting_cats:
-            bat_cols.append(cat.display_name)
+            if cat.stat_id in bat_unscored:
+                bat_cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                bat_cols.append(cat.display_name)
         bat_cols.append("│")  # visual divider between league and statcast
         bat_cols.extend([
             "EV", "MaxEV", "LA", "Barrel%", "HardHit%",
@@ -1444,10 +1611,12 @@ class RosterAnalysisScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = player_ages.get(p.name)
             row: list[Text] = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 Text(f"${actual_cost}" if actual_cost else "-",
                      justify="right"),
                 Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
@@ -1457,7 +1626,9 @@ class RosterAnalysisScreen(Screen):
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in batting_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in bat_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             # Divider
             row.append(Text("│", style="dim"))
             # Statcast columns
@@ -1485,9 +1656,12 @@ class RosterAnalysisScreen(Screen):
         pitch_table.clear(columns=True)
         pitch_table.cursor_type = "row"
         pitch_table.zebra_stripes = True
-        pitch_cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Paid", "Avg$", "SGP", "Y!", "Pre"]
+        pitch_cols: list[str | Text] = ["Player", "Pos".ljust(15), "Team", "Age", "Paid", "Avg$", "SGP", "Y!", "Pre"]
         for cat in pitching_cats:
-            pitch_cols.append(cat.display_name)
+            if cat.stat_id in pitch_unscored:
+                pitch_cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                pitch_cols.append(cat.display_name)
         pitch_cols.append("│")  # visual divider
         pitch_cols.extend([
             "EV Alw", "Barrel%", "HardHit%",
@@ -1506,10 +1680,12 @@ class RosterAnalysisScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = player_ages.get(p.name)
             row = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 Text(f"${actual_cost}" if actual_cost else "-",
                      justify="right"),
                 Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
@@ -1519,7 +1695,9 @@ class RosterAnalysisScreen(Screen):
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in pitching_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in pitch_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             # Divider
             row.append(Text("│", style="dim"))
             # Statcast columns
@@ -1877,15 +2055,17 @@ class FreeAgentScreen(Screen):
         }
         return any(pos in batting_positions for pos in p.position.split(","))
 
-    def _fetch_statcast(
+    def _fetch_statcast_and_ages(
         self, players: list[PlayerStats],
-    ) -> tuple[dict[str, StatcastBatter], dict[str, StatcastPitcher]]:
+    ) -> tuple[dict[str, StatcastBatter], dict[str, StatcastPitcher], dict[str, int]]:
         batter_sc: dict[str, StatcastBatter] = {}
         pitcher_sc: dict[str, StatcastPitcher] = {}
+        mlbam_ids: dict[str, int] = {}
         for p in players:
             mlbam_id = lookup_mlbam_id(p.name)
             if mlbam_id is None:
                 continue
+            mlbam_ids[p.name] = mlbam_id
             if self._is_batter(p):
                 sc = get_batter_statcast(mlbam_id)
                 if sc is not None:
@@ -1894,7 +2074,20 @@ class FreeAgentScreen(Screen):
                 sc = get_pitcher_statcast(mlbam_id)
                 if sc is not None:
                     pitcher_sc[p.name] = sc
-        return batter_sc, pitcher_sc
+        all_ids = list(mlbam_ids.values())
+        age_by_id = get_player_ages(all_ids)
+        games_by_id = get_player_games(all_ids)
+        player_ages = {
+            name: age_by_id[mid]
+            for name, mid in mlbam_ids.items()
+            if mid in age_by_id
+        }
+        # Inject G into player stats dicts for pinned column rendering
+        for p in players:
+            mid = mlbam_ids.get(p.name)
+            if mid and mid in games_by_id and "0" not in p.stats:
+                p.stats["0"] = str(games_by_id[mid])
+        return batter_sc, pitcher_sc, player_ages
 
     async def _load_free_agents(self) -> None:
         _, desc = self.STAT_TYPES[self._stat_type]
@@ -1953,7 +2146,8 @@ class FreeAgentScreen(Screen):
                 all_players_set[p.player_key] = p
 
         await self._show_loading("Loading Statcast data from Baseball Savant...")
-        batter_sc, pitcher_sc = self._fetch_statcast(list(all_players_set.values()))
+        batter_sc, pitcher_sc, self._player_ages = self._fetch_statcast_and_ages(
+            list(all_players_set.values()))
 
         await self._show_loading("Rendering tables...")
 
@@ -2006,7 +2200,7 @@ class FreeAgentScreen(Screen):
         pitchers = [p for p in players if not self._is_batter(p)]
 
         await self._show_loading("Loading Statcast data from Baseball Savant...")
-        batter_sc, pitcher_sc = self._fetch_statcast(players)
+        batter_sc, pitcher_sc, self._player_ages = self._fetch_statcast_and_ages(players)
 
         await self._show_loading("Rendering tables...")
 
@@ -2031,10 +2225,11 @@ class FreeAgentScreen(Screen):
     ) -> None:
         """Compact overview table for the top-15 mixed batter/pitcher list."""
         table._players = players  # type: ignore[attr-defined]
+        ages = getattr(self, "_player_ages", {})
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        table.add_columns("Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre")
+        table.add_columns("Player", "Pos".ljust(15), "Team", "Age", "Avg$", "SGP", "Y!", "Pre")
 
         for p in players:
             sgp_val = self._sgp_calc.player_sgp(p) if self._sgp_calc else None
@@ -2045,10 +2240,12 @@ class FreeAgentScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = ages.get(p.name)
             table.add_row(
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
                      justify="right"),
                 sgp_text,
@@ -2063,15 +2260,18 @@ class FreeAgentScreen(Screen):
         batter_statcast: dict[str, StatcastBatter],
     ) -> None:
         table._players = batters  # type: ignore[attr-defined]
-        scored = [c for c in self.categories if not c.is_only_display]
-        batting_cats = [c for c in scored if c.position_type == "B"]
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        ages = getattr(self, "_player_ages", {})
 
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre"]
+        cols: list[str | Text] = ["Player", "Pos".ljust(15), "Team", "Age", "Avg$", "SGP", "Y!", "Pre"]
         for cat in batting_cats:
-            cols.append(cat.display_name)
+            if cat.stat_id in bat_unscored:
+                cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                cols.append(cat.display_name)
         cols.append("│")
         cols.extend([
             "EV", "MaxEV", "LA", "Barrel%", "HardHit%",
@@ -2094,10 +2294,12 @@ class FreeAgentScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = ages.get(p.name)
             row: list[Text] = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
                      justify="right"),
                 sgp_text,
@@ -2105,7 +2307,9 @@ class FreeAgentScreen(Screen):
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in batting_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in bat_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             # Divider
             row.append(Text("│", style="dim"))
             # Statcast columns
@@ -2135,15 +2339,18 @@ class FreeAgentScreen(Screen):
         pitcher_statcast: dict[str, StatcastPitcher],
     ) -> None:
         table._players = pitchers  # type: ignore[attr-defined]
-        scored = [c for c in self.categories if not c.is_only_display]
-        pitching_cats = [c for c in scored if c.position_type == "P"]
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
+        ages = getattr(self, "_player_ages", {})
 
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        cols: list[str] = ["Player", "Pos".ljust(15), "Team", "Avg$", "SGP", "Y!", "Pre"]
+        cols: list[str | Text] = ["Player", "Pos".ljust(15), "Team", "Age", "Avg$", "SGP", "Y!", "Pre"]
         for cat in pitching_cats:
-            cols.append(cat.display_name)
+            if cat.stat_id in pitch_unscored:
+                cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                cols.append(cat.display_name)
         cols.append("│")
         cols.extend([
             "EV Alw", "Barrel%", "HardHit%",
@@ -2167,10 +2374,12 @@ class FreeAgentScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = ages.get(p.name)
             row: list[Text] = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 Text(f"${p.draft_cost}" if p.draft_cost else "-", style="dim",
                      justify="right"),
                 sgp_text,
@@ -2178,7 +2387,9 @@ class FreeAgentScreen(Screen):
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in pitching_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in pitch_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             # Divider
             row.append(Text("│", style="dim"))
             # Statcast columns
@@ -2506,9 +2717,11 @@ class WatchlistScreen(Screen):
         pitchers = [p for p in self._watchlist_players if p not in batters]
 
         batter_sc: dict[str, StatcastBatter] = {}
+        mlbam_ids: dict[str, int] = {}
         for p in batters:
             mlbam_id = lookup_mlbam_id(p.name)
             if mlbam_id is not None:
+                mlbam_ids[p.name] = mlbam_id
                 sc = get_batter_statcast(mlbam_id)
                 if sc is not None:
                     batter_sc[p.name] = sc
@@ -2517,9 +2730,24 @@ class WatchlistScreen(Screen):
         for p in pitchers:
             mlbam_id = lookup_mlbam_id(p.name)
             if mlbam_id is not None:
+                mlbam_ids[p.name] = mlbam_id
                 sc = get_pitcher_statcast(mlbam_id)
                 if sc is not None:
                     pitcher_sc[p.name] = sc
+
+        all_ids = list(mlbam_ids.values())
+        age_by_id = get_player_ages(all_ids)
+        games_by_id = get_player_games(all_ids)
+        self._player_ages: dict[str, int] = {
+            name: age_by_id[mid]
+            for name, mid in mlbam_ids.items()
+            if mid in age_by_id
+        }
+        # Inject G into player stats dicts for pinned column rendering
+        for p in batters + pitchers:
+            mid = mlbam_ids.get(p.name)
+            if mid and mid in games_by_id and "0" not in p.stats:
+                p.stats["0"] = str(games_by_id[mid])
 
         await self._show_loading("Rendering watchlist...")
         scroll = self.query_one("#wl-scroll", VerticalScroll)
@@ -2544,15 +2772,18 @@ class WatchlistScreen(Screen):
         batter_sc: dict[str, StatcastBatter],
     ) -> None:
         table._players = batters  # type: ignore[attr-defined]
-        scored = [c for c in self.categories if not c.is_only_display]
-        batting_cats = [c for c in scored if c.position_type == "B"]
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        ages = getattr(self, "_player_ages", {})
 
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        cols: list[str] = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP", "Y!", "Pre"]
+        cols: list[str | Text] = ["Player".ljust(20), "Pos".ljust(15), "Team", "Age", "SGP", "Y!", "Pre"]
         for cat in batting_cats:
-            cols.append(cat.display_name)
+            if cat.stat_id in bat_unscored:
+                cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                cols.append(cat.display_name)
         cols.append("│")
         cols.extend(["EV", "MaxEV", "LA", "Barrel%", "HardHit%",
                       "K%", "BB%", "Whiff%", "xBA", "xSLG", "xwOBA"])
@@ -2572,16 +2803,20 @@ class WatchlistScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = ages.get(p.name)
             row: list[Text] = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 sgp_text,
                 Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in batting_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in bat_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             row.append(Text("│", style="dim"))
             sc = batter_sc.get(p.name)
             if sc:
@@ -2607,15 +2842,18 @@ class WatchlistScreen(Screen):
         pitcher_sc: dict[str, StatcastPitcher],
     ) -> None:
         table._players = pitchers  # type: ignore[attr-defined]
-        scored = [c for c in self.categories if not c.is_only_display]
-        pitching_cats = [c for c in scored if c.position_type == "P"]
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
+        ages = getattr(self, "_player_ages", {})
 
         table.clear(columns=True)
         table.cursor_type = "row"
         table.zebra_stripes = True
-        cols: list[str] = ["Player".ljust(20), "Pos".ljust(15), "Team", "SGP", "Y!", "Pre"]
+        cols: list[str | Text] = ["Player".ljust(20), "Pos".ljust(15), "Team", "Age", "SGP", "Y!", "Pre"]
         for cat in pitching_cats:
-            cols.append(cat.display_name)
+            if cat.stat_id in pitch_unscored:
+                cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                cols.append(cat.display_name)
         cols.append("│")
         cols.extend(["EV Alw", "Barrel%", "HardHit%",
                       "xBA", "xSLG", "xwOBA", "xERA",
@@ -2636,16 +2874,20 @@ class WatchlistScreen(Screen):
                 sgp_text = Text("N/A", style="dim", justify="right")
             y_rank = self._rank_lookup.get(p.player_key)
             pre_rank = self._preseason_rank_lookup.get(p.player_key)
+            age = ages.get(p.name)
             row: list[Text] = [
                 Text(p.name[:20].ljust(20), style="bold"),
                 Text(p.position.ljust(15), style="dim"),
                 Text(p.team_abbr, style="dim"),
+                Text(str(age) if age else "-", style="dim", justify="right"),
                 sgp_text,
                 Text(str(y_rank) if y_rank else "-", style="dim", justify="right"),
                 Text(str(pre_rank) if pre_rank else "-", style="dim", justify="right"),
             ]
             for cat in pitching_cats:
-                row.append(Text(p.stats.get(cat.stat_id, "-"), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in pitch_unscored else ""
+                row.append(Text(val, style=style, justify="right"))
             row.append(Text("│", style="dim"))
             sc = pitcher_sc.get(p.name)
             if sc:
@@ -4990,7 +5232,7 @@ class LeagueSelectScreen(Screen):
 
 class ScoreboardScreen(Screen):
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"),
-                ("s", "standings", "Roto Standings"),
+                ("s", "standings", "League Standings"),
                 ("h", "h2h_sim", "H2H Sim"),
                 ("g", "mlb_scores", "MLB Scores"),
                 ("t", "roster", "Roster"),
@@ -4998,10 +5240,11 @@ class ScoreboardScreen(Screen):
                 ("x", "transactions", "Transactions"),
                 ("p", "player_explorer", "Player Explorer"),
                 ("l", "watchlist", "Watchlist"),
-                ("w", "view_weekly", "Weekly"), ("d", "view_daily", "Daily"),
-                ("n", "view_season", "Season"),
-                ("comma", "prev_date", "< Prev Day"),
-                ("full_stop", "next_date", "> Next Day"),
+                Binding("w", "view_weekly", "Weekly", show=False),
+                Binding("d", "view_daily", "Daily", show=False),
+                Binding("n", "view_season", "Season", show=False),
+                Binding("comma", "prev_date", "< Prev Day", show=False),
+                Binding("full_stop", "next_date", "> Next Day", show=False),
                 ("left", "prev_week", "Prev Week"),
                 ("right", "next_week", "Next Week"),
                 ("e", "select_week", "Select Week"),
@@ -5198,18 +5441,21 @@ class ScoreboardScreen(Screen):
         if not self.league:
             return
 
-        cache = self.app.shared_cache
+        try:
+            cache = self.app.shared_cache
 
-        # 1. SGP setup (benefits Roster Analysis, Free Agents, Watchlist)
-        await cache.ensure_loaded(self.api, self.league, self.categories)
+            # 1. SGP setup (benefits Roster Analysis, Free Agents, Watchlist)
+            await cache.ensure_loaded(self.api, self.league, self.categories)
 
-        # 2. Statcast cache warm-up (benefits Roster Analysis, Watchlist)
-        from gkl.statcast import _ensure_cache
-        await asyncio.to_thread(_ensure_cache)
+            # 2. Statcast cache warm-up (benefits Roster Analysis, Watchlist)
+            from gkl.statcast import _ensure_cache
+            await asyncio.to_thread(_ensure_cache)
 
-        # 3. Weekly team stats (benefits Roto Standings, H2H Simulator)
-        weeks = list(range(1, self.league.current_week + 1))
-        await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
+            # 3. Weekly team stats (benefits Roto Standings, H2H Simulator)
+            weeks = list(range(1, self.league.current_week + 1))
+            await cache.prefetch_weeks(self.api, self.league.league_key, weeks)
+        except Exception:
+            pass
 
     async def _refresh_data(self) -> None:
         if not self.league:
@@ -5443,9 +5689,8 @@ class ScoreboardScreen(Screen):
         self.query_one("#bottom-pane").display = True
         self._update_player_view_header(m)
 
-        scored_cats = [c for c in self.categories if not c.is_only_display]
-        batting_cats = [c for c in scored_cats if c.position_type == "B"]
-        pitching_cats = [c for c in scored_cats if c.position_type == "P"]
+        batting_cats, bat_unscored = build_stat_columns(self.categories, "B")
+        pitching_cats, pitch_unscored = build_stat_columns(self.categories, "P")
 
         batting_positions = {"C", "1B", "2B", "3B", "SS", "LF", "CF", "RF",
                              "OF", "Util", "DH", "IF", "BN"}
@@ -5471,26 +5716,31 @@ class ScoreboardScreen(Screen):
                     Static(" Batters", classes="roster-section-label"))
                 bat_table = DataTable()
                 await container.mount(bat_table)
-                self._fill_player_table(bat_table, batters, batting_cats)
+                self._fill_player_table(bat_table, batters, batting_cats, bat_unscored)
 
             if pitchers:
                 await container.mount(
                     Static(" Pitchers", classes="roster-section-label"))
                 pitch_table = DataTable()
                 await container.mount(pitch_table)
-                self._fill_player_table(pitch_table, pitchers, pitching_cats)
+                self._fill_player_table(pitch_table, pitchers, pitching_cats, pitch_unscored)
 
     def _fill_player_table(
         self, table: DataTable, players: list[PlayerStats],
         cats: list[StatCategory],
+        unscored_ids: set[str] | None = None,
     ) -> None:
         table.cursor_type = "row"
         table.zebra_stripes = True
         table._players = players  # type: ignore[attr-defined]
+        unscored = unscored_ids or set()
 
-        cols = ["Player", "Pos"]
+        cols: list[str | Text] = ["Player", "Pos"]
         for cat in cats:
-            cols.append(cat.display_name)
+            if cat.stat_id in unscored:
+                cols.append(Text(f"({cat.display_name})", style="dim italic"))
+            else:
+                cols.append(cat.display_name)
         table.add_columns(*cols)
 
         for p in players:
@@ -5499,8 +5749,9 @@ class ScoreboardScreen(Screen):
                 Text(p.position, style="dim"),
             ]
             for cat in cats:
-                val = p.stats.get(cat.stat_id, "-")
-                row.append(Text(str(val), justify="right"))
+                val = get_stat_value(p.stats, cat.stat_id, cat.display_name)
+                style = "dim italic" if cat.stat_id in unscored else ""
+                row.append(Text(str(val), style=style, justify="right"))
             table.add_row(*row)
 
     def _reload_players(self) -> None:
@@ -5565,7 +5816,7 @@ class ScoreboardScreen(Screen):
     def action_standings(self) -> None:
         if self.league:
             self.app.push_screen(
-                RotoStandingsScreen(self.api, self.league, self.categories)
+                LeagueStandingsScreen(self.api, self.league, self.categories)
             )
 
     def action_h2h_sim(self) -> None:

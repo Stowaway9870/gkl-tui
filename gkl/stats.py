@@ -17,6 +17,70 @@ RATE_STATS = {
     "56": None,     # K/BB ratio
 }
 
+# Stats pinned to always display regardless of league scoring configuration.
+# (display_name, position_type, fallback_stat_id)
+_PINNED_STATS: list[tuple[str, str, str]] = [
+    ("G", "B", "0"),
+    ("AB", "B", "6"),
+    ("IP", "P", "50"),
+]
+
+
+def build_stat_columns(
+    categories: list[StatCategory],
+    position_type: str,
+) -> tuple[list[StatCategory], set[str]]:
+    """Build stat columns with pinned unscored stats before scored stats.
+
+    Returns (ordered_cats, unscored_ids) where ordered_cats has pinned
+    unscored stats first, then scored stats.  unscored_ids contains the
+    stat_ids of pinned stats that aren't league scoring categories.
+    """
+    scored = [c for c in categories if not c.is_only_display and c.position_type == position_type]
+    scored_names = {c.display_name for c in scored}
+
+    pinned: list[StatCategory] = []
+    unscored_ids: set[str] = set()
+
+    for name, ptype, fallback_id in _PINNED_STATS:
+        if ptype != position_type:
+            continue
+        if name in scored_names:
+            continue  # already a scoring category — appears normally
+        # Try to find in league categories (may be display-only)
+        existing = next(
+            (c for c in categories
+             if c.display_name == name and c.position_type == position_type),
+            None,
+        )
+        stat_id = existing.stat_id if existing else fallback_id
+        pinned.append(StatCategory(
+            stat_id=stat_id,
+            display_name=name,
+            sort_order="1",
+            position_type=position_type,
+            is_only_display=True,
+        ))
+        unscored_ids.add(stat_id)
+
+    return pinned + scored, unscored_ids
+
+
+def get_stat_value(stats: dict[str, str], stat_id: str, display_name: str) -> str:
+    """Get a stat value with fallback for derived stats like AB."""
+    val = stats.get(stat_id)
+    if val:
+        return val
+    # Fallback: extract AB from H/AB (stat 60)
+    if display_name == "AB":
+        hab = stats.get("60", "")
+        if "/" in hab:
+            try:
+                return hab.split("/")[1]
+            except IndexError:
+                pass
+    return "-"
+
 
 def aggregate_weekly_stats(
     weekly_data: list[list[TeamStats]],

@@ -542,9 +542,19 @@ def get_statcast_league_averages(
     return {a: mean(vals) if vals else 0.0 for a, vals in collected.items()}
 
 
+_YAHOO_MLBAM_OVERRIDES: dict[str, int] = {
+    # Ohtani is split into two Yahoo player entries (batter 1000001,
+    # pitcher 1000002) but has a single MLBAM ID.
+    "shohei ohtani": 660271,
+}
+
+
 def lookup_mlbam_id(player_name: str) -> int | None:
     """Try to find a player's MLBAM ID by name from cached data."""
     name_lower = player_name.lower()
+    for override_name, override_id in _YAHOO_MLBAM_OVERRIDES.items():
+        if override_name in name_lower:
+            return override_id
     for pid, entry in _batter_cache.items():
         if name_lower in entry.player_name.lower():
             return pid
