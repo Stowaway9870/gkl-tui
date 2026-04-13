@@ -4978,6 +4978,7 @@ class MLBScoreboardScreen(Screen):
         super().__init__()
         from datetime import date as date_cls
         self._date = date_cls.today()
+        self._games: list[MLBGame] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -5123,27 +5124,26 @@ class MLBScoreboardScreen(Screen):
         self.app.pop_screen()
 
     def action_mlbtv(self) -> None:
-        games = getattr(self, "_games", [])
-        if len(games) > 0:
-           self._show_mlbtv_picker(games)
+        if self._games:
+            self._show_mlbtv_picker(self._games)
         else:
-           self.notify("No games available", severity="information")
+            self.notify("No games available", severity="information")
 
-    def _show_mlbtv_picker(
-        self, games: list[MLBGame]) -> None:
-        def on_game_selected(gamePk: str) -> None:
-            if gamePk != "":
-               webbrowser.open("https://www.mlb.com/tv/g" + gamePk)
+    def _show_mlbtv_picker(self, games: list[MLBGame]) -> None:
+        def on_game_selected(game_pk: str | None) -> None:
+            if game_pk:
+                webbrowser.open("https://www.mlb.com/tv/g" + game_pk)
 
         self.app.push_screen(
             MlbtvSelectScreen(games), callback=on_game_selected
         )
 
+
 # --- MLB.TV Selection Screen ---
 
 
 class MlbtvSelectScreen(Screen):
-    """Full-screen league picker shown when user has multiple leagues."""
+    """Game picker for opening an MLB.TV stream."""
     BINDINGS = [("escape", "quit", "Quit"), ("q", "quit", "Quit")]
     CSS = """
     MlbtvSelectScreen {
@@ -5173,7 +5173,7 @@ class MlbtvSelectScreen(Screen):
     }
     #mlbtv-select-list {
         height: 15;
-        max-height: 85%
+        max-height: 85%;
     }
     #mlbtv-select-list > ListItem {
         height: 1;
@@ -5187,6 +5187,7 @@ class MlbtvSelectScreen(Screen):
     def __init__(self, games: list[MLBGame]) -> None:
         super().__init__()
         self.games = games
+        self._game_pks: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Vertical(id="mlbtv-select-container"):
@@ -5195,30 +5196,29 @@ class MlbtvSelectScreen(Screen):
             yield ListView(id="mlbtv-select-list")
 
     def on_mount(self) -> None:
-        gv = self.query_one("#mlbtv-select-list", ListView)
-        for i, game in enumerate(self.games):
+        lv = self.query_one("#mlbtv-select-list", ListView)
+        for game in self.games:
             label = Text()
             label.append(f"{game.away_team} {game.away_score}", style="bold")
-            label.append(" @ ", style = "dim")
+            label.append(" @ ", style="dim")
             label.append(f"{game.home_team} {game.home_score}", style="bold")
             if game.status == "Preview":
-               label.append(" " + game.detail_status, style="dim")
+                label.append(" " + game.detail_status, style="dim")
             elif game.status == "Final":
-               label.append(" Final", style="dim")
+                label.append(" Final", style="dim")
             else:
-               label.append(" " + game.inning_half + " " + game.inning_ordinal, style="bold")
-            item = ListItem(Label(label))
-            item._gamePk = game.gamePk
-            gv.mount(item)
-        gv.index = 0
+                label.append(" " + game.inning_half + " " + game.inning_ordinal, style="bold")
+            lv.mount(ListItem(Label(label)))
+            self._game_pks.append(game.game_pk)
+        lv.index = 0
 
     def on_list_view_selected(self, event: ListView.Selected) -> None:
-        gamePk = getattr(event.item, "_gamePk", None)
-        if gamePk:
-            self.dismiss(gamePk)
+        idx = self.query_one("#mlbtv-select-list", ListView).index
+        if idx is not None and 0 <= idx < len(self._game_pks):
+            self.dismiss(self._game_pks[idx])
 
     def action_quit(self) -> None:
-        self.dismiss("")
+        self.dismiss(None)
 
 # --- Ask Skipper (AI Chat) ---
 
