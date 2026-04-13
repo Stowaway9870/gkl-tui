@@ -7,6 +7,8 @@ import os
 import sys
 from datetime import date
 
+import webbrowser
+
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -4908,7 +4910,8 @@ class MLBScoreboardScreen(Screen):
                 ("r", "refresh", "Refresh"),
                 ("comma", "prev_day", "< Prev Day"),
                 ("full_stop", "next_day", "> Next Day"),
-                ("t", "today", "Today")]
+                ("t", "today", "Today"),
+                ("m", "mlbtv", "MLB.TV")]
     CSS = """
     #mlb-header {
         height: 1;
@@ -4975,6 +4978,7 @@ class MLBScoreboardScreen(Screen):
         super().__init__()
         from datetime import date as date_cls
         self._date = date_cls.today()
+        self._games: list[MLBGame] = []
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -5001,6 +5005,7 @@ class MLBScoreboardScreen(Screen):
 
     async def _load(self) -> None:
         games = get_mlb_scoreboard(self._date)
+        self._games = games
 
         loading = self.query("#mlb-loading")
         if loading:
@@ -5118,6 +5123,102 @@ class MLBScoreboardScreen(Screen):
     def action_go_back(self) -> None:
         self.app.pop_screen()
 
+    def action_mlbtv(self) -> None:
+        if self._games:
+            self._show_mlbtv_picker(self._games)
+        else:
+            self.notify("No games available", severity="information")
+
+    def _show_mlbtv_picker(self, games: list[MLBGame]) -> None:
+        def on_game_selected(game_pk: str | None) -> None:
+            if game_pk:
+                webbrowser.open("https://www.mlb.com/tv/g" + game_pk)
+
+        self.app.push_screen(
+            MlbtvSelectScreen(games), callback=on_game_selected
+        )
+
+
+# --- MLB.TV Selection Screen ---
+
+
+class MlbtvSelectScreen(Screen):
+    """Game picker for opening an MLB.TV stream."""
+    BINDINGS = [("escape", "quit", "Quit"), ("q", "quit", "Quit")]
+    CSS = """
+    MlbtvSelectScreen {
+        align: center middle;
+    }
+    #mlbtv-select-container {
+        width: 60;
+        height: auto;
+        max-height: 80%;
+        background: $surface;
+        border: solid $primary;
+        padding: 1 2;
+    }
+    #mlbtv-select-title {
+        height: 1;
+        content-align: center middle;
+        text-style: bold;
+        background: $primary;
+        color: $foreground;
+    }
+    #mlbtv-controls {
+        height: 1;
+        content-align: center middle;
+        background: $surface;
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+    #mlbtv-select-list {
+        height: 15;
+        max-height: 85%;
+    }
+    #mlbtv-select-list > ListItem {
+        height: 1;
+        padding: 0 1;
+    }
+    #mlbtv-select-list > ListItem.--highlight {
+        background: #3A5A3A;
+    }
+    """
+
+    def __init__(self, games: list[MLBGame]) -> None:
+        super().__init__()
+        self.games = games
+        self._game_pks: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="mlbtv-select-container"):
+            yield Static("Select game to view MLB.TV Stream", id="mlbtv-select-title")
+            yield Static("\\[esc] or \\[q] to go back", id="mlbtv-controls")
+            yield ListView(id="mlbtv-select-list")
+
+    def on_mount(self) -> None:
+        lv = self.query_one("#mlbtv-select-list", ListView)
+        for game in self.games:
+            label = Text()
+            label.append(f"{game.away_team} {game.away_score}", style="bold")
+            label.append(" @ ", style="dim")
+            label.append(f"{game.home_team} {game.home_score}", style="bold")
+            if game.status == "Preview":
+                label.append(" " + game.detail_status, style="dim")
+            elif game.status == "Final":
+                label.append(" Final", style="dim")
+            else:
+                label.append(" " + game.inning_half + " " + game.inning_ordinal, style="bold")
+            lv.mount(ListItem(Label(label)))
+            self._game_pks.append(game.game_pk)
+        lv.index = 0
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = self.query_one("#mlbtv-select-list", ListView).index
+        if idx is not None and 0 <= idx < len(self._game_pks):
+            self.dismiss(self._game_pks[idx])
+
+    def action_quit(self) -> None:
+        self.dismiss(None)
 
 # --- Ask Skipper (AI Chat) ---
 
